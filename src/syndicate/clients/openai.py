@@ -327,6 +327,28 @@ class OpenAIClient(Client):
         # complete ToolCall objects only after the stream ends.
         _tool_call_acc: Dict[int, Dict[str, Any]] = {}
         last_finish_reason: Optional[str] = None
+        emitted_terminal_chunk = False
+
+        def _build_final_tool_calls() -> Optional[List[ToolCall]]:
+            if not _tool_call_acc:
+                return None
+
+            final_tool_calls: List[ToolCall] = []
+            for _idx in sorted(_tool_call_acc):
+                tc = _tool_call_acc[_idx]
+                raw_args = tc.get("arguments", "{}")
+                try:
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                final_tool_calls.append(
+                    ToolCall(
+                        id=tc.get("id", ""),
+                        name=tc.get("name", ""),
+                        arguments=parsed_args,
+                    )
+                )
+            return final_tool_calls
 
         async with client.stream(
             "POST",
@@ -346,29 +368,14 @@ class OpenAIClient(Client):
                     # Handle [DONE] marker
                     if data_str.strip() == "[DONE]":
                         # Emit accumulated tool calls as complete ToolCall objects
-                        final_tool_calls = None
-                        if _tool_call_acc:
-                            final_tool_calls = []
-                            for _idx in sorted(_tool_call_acc):
-                                tc = _tool_call_acc[_idx]
-                                raw_args = tc.get("arguments", "{}")
-                                try:
-                                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                                except json.JSONDecodeError:
-                                    parsed_args = {}
-                                final_tool_calls.append(
-                                    ToolCall(
-                                        id=tc.get("id", ""),
-                                        name=tc.get("name", ""),
-                                        arguments=parsed_args,
-                                    )
-                                )
+                        final_tool_calls = _build_final_tool_calls()
                         yield StreamChunk(
                             content="",
                             is_finished=True,
                             finish_reason=last_finish_reason or ("tool_calls" if final_tool_calls else "stop"),
                             tool_calls=final_tool_calls,
                         )
+                        emitted_terminal_chunk = True
                         break
                     
                     try:
@@ -419,6 +426,17 @@ class OpenAIClient(Client):
                     except json.JSONDecodeError:
                         # Skip invalid JSON
                         continue
+
+        # If stream ended unexpectedly without [DONE], flush tool calls so they
+        # are not silently lost by downstream orchestration.
+        if not emitted_terminal_chunk and _tool_call_acc:
+            final_tool_calls = _build_final_tool_calls()
+            yield StreamChunk(
+                content="",
+                is_finished=True,
+                finish_reason=last_finish_reason or "tool_calls",
+                tool_calls=final_tool_calls,
+            )
     
     # -- Async context manager for proper lifecycle management --
 

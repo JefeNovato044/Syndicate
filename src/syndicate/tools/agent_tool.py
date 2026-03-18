@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, Optional, Any
+from uuid import uuid4
 from pydantic import BaseModel, Field
 from .base_tool import BaseTool
 
@@ -16,6 +17,14 @@ class AgentDelegationArgs(BaseModel):
     context: Optional[str] = Field(
         None,
         description="Additional context that might help the agent complete the task."
+    )
+    owner_id: Optional[str] = Field(
+        None,
+        description="Optional memory owner_id for delegated calls. If omitted, an isolated owner is generated."
+    )
+    chat_id: Optional[str] = Field(
+        None,
+        description="Optional memory chat_id for delegated calls. If omitted, an isolated chat is generated."
     )
 
 
@@ -85,7 +94,9 @@ class AgentAsTool(BaseTool):
         """
         args = self.args_schema(**kwargs)
         full_message = f"{args.task}\n\nAdditional context:\n{args.context}" if args.context else args.task
-        return self.agent.invoke_sync(full_message, owner_id="delegation", chat_id="delegation")
+        owner_id = args.owner_id or f"delegation:{uuid4().hex}"
+        chat_id = args.chat_id or f"delegation:{uuid4().hex}"
+        return self.agent.invoke_sync(full_message, owner_id=owner_id, chat_id=chat_id)
 
     async def run_async(self, **kwargs) -> str:
         """
@@ -104,10 +115,12 @@ class AgentAsTool(BaseTool):
         """
         args = self.args_schema(**kwargs)
         full_message = f"{args.task}\n\nAdditional context:\n{args.context}" if args.context else args.task
+        owner_id = args.owner_id or f"delegation:{uuid4().hex}"
+        chat_id = args.chat_id or f"delegation:{uuid4().hex}"
         return await self.agent.invoke(
             full_message,
-            owner_id="delegation",
-            chat_id="delegation",
+            owner_id=owner_id,
+            chat_id=chat_id,
         )
     
     # Override class methods to work with instance properties

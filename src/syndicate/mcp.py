@@ -104,18 +104,32 @@ class MCPSubTool(BaseTool):
                 self._mcp_tool_name,
                 arguments=kwargs,
             )
-            # Flatten MCP content blocks into a single string
+
+            # Preserve structure instead of flattening to plain text.
+            if hasattr(result, "model_dump"):
+                return json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
+
             if hasattr(result, "content"):
-                parts = []
+                structured_content = []
                 for item in result.content:
-                    if hasattr(item, "text"):
-                        parts.append(item.text)
+                    if hasattr(item, "model_dump"):
+                        structured_content.append(item.model_dump(mode="json"))
+                    elif hasattr(item, "text"):
+                        structured_content.append({"type": "text", "text": item.text})
                     else:
-                        parts.append(str(item))
-                return "\n".join(parts) if parts else ""
-            return str(result)
+                        structured_content.append({"type": "unknown", "value": str(item)})
+
+                payload = {
+                    "content": structured_content,
+                    "isError": bool(getattr(result, "isError", False)),
+                }
+                return json.dumps(payload, ensure_ascii=False)
+
+            return json.dumps({"value": str(result)}, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"error": str(exc)})
+            raise RuntimeError(
+                f"MCP tool '{self._mcp_tool_name}' failed: {exc}"
+            ) from exc
 
     def to_format(self, provider: str) -> Dict[str, Any]:
         """

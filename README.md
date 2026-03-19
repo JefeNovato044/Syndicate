@@ -90,6 +90,21 @@ pip install -e .
 - `pymongo>=4.16.0` - MongoDB persistent memory
 - `python-dotenv>=1.2.1` - Environment variable management
 
+## Testing
+
+Run the regression suite to validate concurrency and client hardening behavior:
+
+```bash
+python -m unittest tests/test_regressions.py -v
+```
+
+This suite includes coverage for:
+- delegation memory isolation (including concurrent delegation)
+- MCP sub-tool contract behavior
+- OpenAI streaming tool-call flush behavior
+- OpenAI malformed tool-argument fallback + warning logs
+- OpenAI HTTP connection pool limit configuration
+
 ## Quick Start
 
 ### Declaring a Client

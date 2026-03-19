@@ -9,12 +9,12 @@ Uses SQLAlchemy 2.0+ async API with aiosqlite and asyncpg drivers.
 
 import json
 import logging
+import asyncio
 from typing import Optional, List, Dict, Any
 from uuid import uuid4
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    create_engine,
     Column,
     String,
     Boolean,
@@ -62,9 +62,22 @@ def _make_bucket_model(table_name: str = "chat_buckets"):
     if table_name == "chat_buckets":
         return ChatBucket
 
-    # Dynamic subclass with its own __tablename__ — fully isolated
+    # Dynamic model with full schema bound to custom table name.
+    # Use explicit columns (instead of subclassing ChatBucket) so SQLAlchemy can
+    # resolve index/constraint columns deterministically during class mapping.
     attrs = {
         "__tablename__": table_name,
+        "id": Column(Integer, primary_key=True, autoincrement=True),
+        "bucket_id": Column(String(36), unique=True, nullable=False, index=True),
+        "owner_id": Column(String(255), nullable=False, index=True),
+        "chat_id": Column(String(255), nullable=False, index=True),
+        "messages": Column(Text, nullable=False, default="[]"),
+        "summary": Column(Text, nullable=True),
+        "is_active": Column(Boolean, nullable=False, default=True, index=True),
+        "position": Column(Integer, nullable=False, default=0, index=True),
+        "created_at": Column(DateTime, nullable=False, default=datetime.now(timezone.utc)),
+        "closed_at": Column(DateTime, nullable=True),
+        "estimated_tokens": Column(Integer, nullable=True),
         "__table_args__": (
             Index(f"idx_{table_name}_owner_chat_active", "owner_id", "chat_id", "is_active"),
             Index(f"idx_{table_name}_owner_chat_position", "owner_id", "chat_id", "position"),
@@ -79,7 +92,7 @@ def _make_bucket_model(table_name: str = "chat_buckets"):
             {"extend_existing": True},
         ),
     }
-    model = type(f"ChatBucket_{table_name}", (ChatBucket,), attrs)
+    model = type(f"ChatBucket_{table_name}", (Base,), attrs)
     return model
 
 
@@ -193,6 +206,7 @@ class SqlitePostgresMemory(BaseChatMemory):
         self._engine: Optional[AsyncEngine] = None
         self._session_maker: Optional[async_sessionmaker[AsyncSession]] = None
         self._tables_created = False
+        self._tables_lock = asyncio.Lock()
     
     def _get_engine(self) -> AsyncEngine:
         """Lazy initialization of async engine."""
@@ -214,13 +228,17 @@ class SqlitePostgresMemory(BaseChatMemory):
         """Create tables if they don't exist (idempotent)."""
         if self._tables_created:
             return
-        
-        engine = self._get_engine()
-        
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        
-        self._tables_created = True
+
+        async with self._tables_lock:
+            if self._tables_created:
+                return
+
+            engine = self._get_engine()
+
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+
+            self._tables_created = True
     
     def _get_session(self) -> AsyncSession:
         """Get a database session."""
@@ -408,7 +426,7 @@ class SqlitePostgresMemory(BaseChatMemory):
                 select(M).where(
                     M.owner_id == owner_id,
                     M.chat_id == chat_id,
-                    M.is_active == True
+                    M.is_active.is_(True)
                 ).order_by(M.position.desc()).limit(1)
             )
             db_bucket = result.scalar_one_or_none()
@@ -457,7 +475,7 @@ class SqlitePostgresMemory(BaseChatMemory):
                 update(M).where(
                     M.owner_id == owner_id,
                     M.chat_id == chat_id,
-                    M.is_active == True
+                    M.is_active.is_(True)
                 ).values(
                     is_active=False,
                     closed_at=datetime.now(timezone.utc)
@@ -490,7 +508,7 @@ class SqlitePostgresMemory(BaseChatMemory):
                     select(M).where(
                         M.owner_id == owner_id,
                         M.chat_id == chat_id,
-                        M.is_active == True,
+                        M.is_active.is_(True),
                     ).order_by(M.position.desc()).limit(1)
                 )
                 existing_bucket = existing_result.scalar_one_or_none()
@@ -536,8 +554,8 @@ class SqlitePostgresMemory(BaseChatMemory):
                 select(M.summary, M.position).where(
                     M.owner_id == owner_id,
                     M.chat_id == chat_id,
-                    M.is_active == False,
-                    M.summary != None
+                    M.is_active.is_(False),
+                    M.summary.is_not(None)
                 ).order_by(M.position.asc())
             )
             
@@ -714,8 +732,8 @@ class SqlitePostgresMemory(BaseChatMemory):
             
             result = await session.execute(query)
             buckets = []
-            for row in result:
-                buckets.append(self._db_to_bucket(row))
+            for db_bucket in result.scalars().all():
+                buckets.append(self._db_to_bucket(db_bucket))
             
             return buckets
 
@@ -736,7 +754,7 @@ class SqlitePostgresMemory(BaseChatMemory):
             
             # Active buckets
             result = await session.execute(
-                select(func.count(M.id)).where(M.is_active == True)
+                select(func.count(M.id)).where(M.is_active.is_(True))
             )
             active_buckets = result.scalar() or 0
             

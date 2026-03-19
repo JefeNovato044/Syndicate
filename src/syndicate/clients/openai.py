@@ -1,6 +1,5 @@
 """OpenAI-compatible client for local models (Ollama, LM Studio, vLLM, etc.)."""
 
-import asyncio
 import json
 import logging
 from typing import List, Optional, Dict, Any
@@ -144,6 +143,12 @@ class OpenAIClient(Client):
                         try:
                             raw_args = json.loads(raw_args)
                         except json.JSONDecodeError:
+                            logger.warning(
+                                "Malformed tool call arguments from %s (tool=%s): %s",
+                                self.model_name,
+                                tool_call.get("function", {}).get("name", "unknown"),
+                                raw_args
+                            )
                             raw_args = {}
                     tool_calls.append(ToolCall(
                         id=tool_call.get("id", ""),
@@ -211,7 +216,12 @@ class OpenAIClient(Client):
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
-                }
+                },
+                limits=httpx.Limits(
+                    max_connections=50,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=30,
+                ),
             )
         return self._async_client
 
@@ -340,6 +350,10 @@ class OpenAIClient(Client):
                 try:
                     parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "Malformed tool call arguments from %s (tool=%s): %s",
+                        self.model_name, tc.get("name", "unknown"), raw_args,
+                    )
                     parsed_args = {}
                 final_tool_calls.append(
                     ToolCall(

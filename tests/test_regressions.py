@@ -6,8 +6,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 from uuid import uuid4
+from collections.abc import AsyncGenerator
 
-from syndicate.communication_models import Message, ToolCall, ChatResponse
+from syndicate.protocols import AgentInterface
+from syndicate.agents.runtime import AgentRuntime
+from syndicate.agents.base import BaseAgent
+from syndicate.communication_models import Message, ToolCall, ChatResponse, StreamChunk
 from syndicate.clients.gemini import GeminiClient
 from syndicate.clients.openai import OpenAIClient
 from syndicate.memory.local import LocalMemory
@@ -78,6 +82,33 @@ class _FakeAsyncHTTPClient:
 
     def stream(self, method, url, json=None):
         return _FakeStreamResponse(self._lines)
+
+
+class _FakeAgentRuntimeTarget:
+    def __init__(self):
+        self.calls = []
+
+    async def invoke(self, user_input, owner_id="default", chat_id="default"):
+        self.calls.append(("invoke", user_input, owner_id, chat_id))
+        return f"echo:{user_input}"
+
+    async def stream(
+        self,
+        user_input,
+        owner_id="default",
+        chat_id="default",
+        include_thinking=False,
+    ) -> AsyncGenerator:
+        self.calls.append(("stream", user_input, owner_id, chat_id, include_thinking))
+        yield StreamChunk(content="chunk-1", is_finished=False)
+        yield StreamChunk(content="", is_finished=True)
+
+    def invoke_sync(self, user_input, owner_id="default", chat_id="default"):
+        self.calls.append(("invoke_sync", user_input, owner_id, chat_id))
+        return f"sync:{user_input}"
+
+    def install_skill(self, _skill):
+        return "should never be visible from runtime facade"
 
 
 class DelegationIsolationTests(unittest.IsolatedAsyncioTestCase):
@@ -539,6 +570,54 @@ class ConcurrentDelegationTests(unittest.IsolatedAsyncioTestCase):
         for owner_id, chat_id in ids:
             self.assertTrue(owner_id.startswith("delegation:"))
             self.assertTrue(chat_id.startswith("delegation:"))
+
+
+class AgentInterfaceAndRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_facade_forwards_operational_calls(self):
+        target = _FakeAgentRuntimeTarget()
+        runtime = AgentRuntime(target)
+
+        self.assertTrue(isinstance(runtime, AgentInterface))
+
+        invoke_result = await runtime.invoke("hello", owner_id="o", chat_id="c")
+        self.assertEqual(invoke_result, "echo:hello")
+
+        chunks = []
+        async for chunk in runtime.stream("stream-it", owner_id="o2", chat_id="c2", include_thinking=True):
+            chunks.append(chunk)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0].content, "chunk-1")
+        self.assertTrue(chunks[-1].is_finished)
+
+        sync_result = runtime.invoke_sync("sync", owner_id="o3", chat_id="c3")
+        self.assertEqual(sync_result, "sync:sync")
+
+    async def test_runtime_facade_hides_configuration_methods(self):
+        target = _FakeAgentRuntimeTarget()
+        runtime = AgentRuntime(target)
+
+        self.assertFalse(hasattr(runtime, "install_skill"))
+        self.assertFalse(hasattr(runtime, "add_tool"))
+        self.assertFalse(hasattr(runtime, "set_system_prompt"))
+
+    async def test_base_agent_as_runtime_returns_cached_facade(self):
+        class _FakeLLMClient:
+            provider_type = "openai"
+
+            async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+                return ChatResponse(content="ok", role="ai")
+
+            async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+                yield StreamChunk(content="ok", is_finished=True)
+
+        memory = LocalMemory(rollover_enabled=False)
+        agent = BaseAgent(llm_client=_FakeLLMClient(), memory=memory, system_prompt="sys")
+
+        runtime_a = agent.as_runtime()
+        runtime_b = agent.as_runtime()
+
+        self.assertIs(runtime_a, runtime_b)
+        self.assertTrue(isinstance(runtime_a, AgentInterface))
 
 
 if __name__ == "__main__":

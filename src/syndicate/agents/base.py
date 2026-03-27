@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..tools.agent_tool import AgentAsTool
+    from .runtime import AgentRuntime
     from ..skills import SkillModule
     from ..clients import Client
 
@@ -123,6 +124,7 @@ class BaseAgent(ABC):
         
         # Cached tool wrapper
         self._as_tool_cache: Optional["AgentAsTool"] = None
+        self._as_runtime_cache: Optional["AgentRuntime"] = None
 
         # Request-local snapshots (prevents cross-request state contamination)
         self._request_system_prompt_ctx: ContextVar[Optional[str]] = ContextVar(
@@ -876,6 +878,14 @@ class BaseAgent(ABC):
             self._as_tool_cache = tool
         
         return tool
+
+    def as_runtime(self) -> "AgentRuntime":
+        """Return a runtime-only facade exposing invoke/stream/invoke_sync."""
+        from .runtime import AgentRuntime
+
+        if self._as_runtime_cache is None:
+            self._as_runtime_cache = AgentRuntime(self)
+        return self._as_runtime_cache
     
     def register(self) -> "BaseAgent":
         """

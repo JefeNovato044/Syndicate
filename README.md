@@ -56,7 +56,7 @@ These changes reduce race conditions under concurrent load and improve productio
 | Layer | Purpose | Examples |
 |-------|---------|----------|
 | **LLM Client** | Provider abstraction | `GeminiClient`, `OpenAIClient` |
-| **Memory** | Conversation storage | `LocalMemory`, `MongoMemory` |
+| **Memory** | Conversation storage | `LocalMemory`, `MongoMemory`, `SqlitePostgresMemory` |
 | **Tools** | Function execution | `BaseTool`, `CurrentWeatherTool`, `AgentAsTool` |
 | **Skills** | Domain expertise | `SkillModule` |
 | **Agents** | Orchestration | `BaseAgent`, `GenericAgent` |
@@ -104,6 +104,11 @@ This suite includes coverage for:
 - OpenAI streaming tool-call flush behavior
 - OpenAI malformed tool-argument fallback + warning logs
 - OpenAI HTTP connection pool limit configuration
+- Gemini message/response contract behavior
+- LocalMemory rollover and tenant isolation behavior
+- SqlitePostgresMemory concurrent bucket-creation safety
+- SqlitePostgresMemory custom `table_name` concurrency path
+- MongoMemory duplicate-key race fallback behavior
 
 ## Quick Start
 
@@ -433,6 +438,55 @@ Core agent class. Implements a Template Method Pattern with a Hybrid API.
 | `install_skill(skill)` | Add a `SkillModule` at runtime (chainable) |
 | `get_history(owner_id, chat_id)` | Retrieve raw conversation history |
 
+### Operational Interface (Web/Service Runtime)
+
+For production web services, depend on the minimal operational contract rather than the full mutable agent API.
+
+```python
+from syndicate import AgentInterface
+from syndicate.agents import GenericAgent
+
+agent = GenericAgent(...)
+
+# Runtime-only facade exposing invoke/stream/invoke_sync
+runtime: AgentInterface = agent.as_runtime()
+result = await runtime.invoke("Hello", owner_id="tenant", chat_id="session")
+```
+
+This helps separate setup-time mutators (`install_skill`, `add_tool`, `set_system_prompt`, etc.) from request-time execution in concurrent services.
+
+#### Why this matters for web backends
+
+- Clear dependency boundary: handlers/services can accept `AgentInterface` instead of `BaseAgent`.
+- Runtime safety by design: `AgentRuntime` exposes only `invoke`, `stream`, and `invoke_sync`.
+- Easier testing: mock a tiny interface instead of constructing full agent graphs.
+
+#### FastAPI-style pattern
+
+```python
+from fastapi import Depends, FastAPI
+from syndicate import AgentInterface
+from syndicate.agents import GenericAgent
+
+app = FastAPI()
+
+def get_runtime() -> AgentInterface:
+    # Build once at startup in real apps; simplified here for readability.
+    agent = GenericAgent(...)
+    return agent.as_runtime()
+
+@app.post("/chat")
+async def chat(payload: dict, runtime: AgentInterface = Depends(get_runtime)):
+    text = await runtime.invoke(
+        payload["message"],
+        owner_id=payload.get("owner_id", "default"),
+        chat_id=payload.get("chat_id", "default"),
+    )
+    return {"response": text}
+```
+
+See `examples/runtime_interface_example.py` for a framework-agnostic runtime wrapper and mock-friendly pattern.
+
 ### GenericAgent
 
 Zero-boilerplate agent, inherits everything from `BaseAgent`. Ideal for prototypes, interactive notebooks, and quick experiments.
@@ -573,19 +627,22 @@ src/syndicate/
 │   ├── base.py          # BaseChatMemory, BaseRAGMemory ABCs
 │   ├── local.py         # LocalMemory (in-process)
 │   ├── mongo.py         # MongoMemory (persistent, multi-tenant)
+│   ├── sqlite_postgres.py # SqlitePostgresMemory (SQLite/PostgreSQL)
 │   └── summarizers.py   # Bucket summarization utilities
 ├── skills/
 │   ├── skill_module.py  # SkillModule + create_skill_module()
 │   ├── examples.py      # Built-in skill examples
-│   ├── mcp_skill.py     # MCP server skill
+│   ├── rag_skill.py     # KnowledgeBaseSkill
+│   ├── elasticsearch_skill.py # Elasticsearch domain skill
 │   └── registry.py      # SkillRegistry
 ├── tools/
 │   ├── base_tool.py     # BaseTool abstraction
 │   ├── agent_tool.py    # AgentAsTool wrapper
-│   ├── mcp_tool.py      # MCPClientTool
+│   ├── rag_tool.py      # RAG retrieval tool
 │   └── weather_tool.py  # CurrentWeatherTool (example)
+├── mcp.py                   # MCPSessionManager, MCPSubTool
 ├── communication_models.py  # Message, ToolCall, StreamChunk, …
-└── registry.py              # AgentRegistry, MCPRegistry
+└── registry.py              # AgentRegistry
 ```
 
 ## MCP Integration
@@ -601,7 +658,7 @@ Syndicate has built-in support for MCP (Model Context Protocol) servers, enablin
 │  │  LLM Client │  │   Memory    │  │       Skills         │  │
 │  └─────────────┘  └─────────────┘  └──────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────┐     │
-│  │           MCP Registry (Server Discovery)            │     │
+│  │         MCPSessionManager (Persistent Sessions)      │     │
 │  │  ┌────────────┐  ┌────────────┐  ┌───────────────┐   │     │
 │  │  │ Filesystem │  │ PostgreSQL │  │    GitHub     │   │     │
 │  │  └────────────┘  └────────────┘  └───────────────┘   │     │
@@ -613,42 +670,51 @@ Syndicate has built-in support for MCP (Model Context Protocol) servers, enablin
 
 | Component | Purpose | Module |
 |-----------|---------|--------|
-| `MCPRegistry` | Central registry for MCP servers | `syndicate.registry` |
-| `MCPClientTool` | Generic tool for executing MCP tools | `syndicate.tools.mcp_tool` |
-| `MCPServerSkill` | Domain expertise wrapper for MCP servers | `syndicate.skills.mcp_skill` |
+| `MCPSessionManager` | Registers servers, owns long-lived sessions, discovers sub-tools | `syndicate.mcp` |
+| `MCPSubTool` | One discovered MCP sub-tool exposed as a normal Syndicate tool | `syndicate.mcp` |
 
 ### Quick Start
 
 ```python
-from syndicate.registry import MCPRegistry
-from syndicate.tools.mcp_tool import MCPClientTool
-from mcp import StdioServerParameters
+from syndicate.mcp import MCPSessionManager
+from syndicate.agents import GenericAgent
 
-# 1. Register a server
-MCPRegistry.register_server(
+mgr = MCPSessionManager()
+mgr.register(
     name="filesystem",
-    server_params=StdioServerParameters(
-        command="npx",
-        args=["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
-    )
+    command="npx",
+    args=["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
 )
 
-# 2. Attach to an agent
-mcp_tool = MCPClientTool(mcp_registry=MCPRegistry)
-agent = GenericAgent(llm_client=client, tools=[mcp_tool], ...)
+# Start sessions and discover tools once
+await mgr.start()
+
+# Attach discovered MCP tools to an agent
+agent = GenericAgent(
+    llm_client=client,
+    tools=mgr.get_tools("filesystem"),
+)
+
+# ... use agent ...
+
+# Shutdown cleanup
+await mgr.close()
 ```
 
-See [examples/mcp_usage_example.py](examples/mcp_usage_example.py) for more patterns.
+Note: there is currently no dedicated MCP example in `examples/`; use this section as the reference pattern.
 
 ## Roadmap
 
-- [x] MongoDB persistent memory with bucket rollover & summarization
-- [x] MCP (Model Context Protocol) tool integration
-- [x] OpenAI-compatible client (Ollama, LM Studio, vLLM, cloud OpenAI)
-- [ ] A2A (Agent-to-Agent) protocol implementation
-- [ ] Vision and audio client support
-- [ ] Built-in skill library (Kubernetes, Python, Git, SQL, …)
-- [ ] Async tool execution
+The canonical roadmap lives in `ROADMAP.md`.
+
+Current highlights:
+- [x] MongoDB + SQLite/PostgreSQL persistent memory with bucket rollover and summarization
+- [x] MCP integration via persistent `MCPSessionManager` sessions and discovered `MCPSubTool`s
+- [x] OpenAI-compatible and Gemini client support with hardened streaming/tool-call parsing
+- [ ] Telemetry middleware for token/cost observability
+- [ ] Native Anthropic client support
+- [ ] Sensorial foundation + vision/speech/audio adapters
+- [ ] Elasticsearch memory and vector store
 
 ## License
 

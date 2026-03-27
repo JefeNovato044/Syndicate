@@ -12,6 +12,7 @@ from .communication_models import (
     ChatResponse,
     StreamChunk,
 )
+from .protocols import AgentInterface
 
 # Import registry for agent discovery
 from .registry import AgentRegistry
@@ -36,6 +37,7 @@ __all__ = [
     'ToolCall',
     'ChatResponse',
     'StreamChunk',
+    'AgentInterface',
     # Registries
     'AgentRegistry',
     'MCPSessionManager',

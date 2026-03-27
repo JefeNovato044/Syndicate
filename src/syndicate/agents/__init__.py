@@ -19,5 +19,6 @@ Example:
 
 from .base import BaseAgent
 from .generic import GenericAgent
+from .runtime import AgentRuntime
 
-__all__ = ['BaseAgent', 'GenericAgent']
+__all__ = ['BaseAgent', 'GenericAgent', 'AgentRuntime']

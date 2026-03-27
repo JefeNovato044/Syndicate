@@ -1,0 +1,44 @@
+"""Runtime-only facade for safe web/service consumption."""
+
+from collections.abc import AsyncGenerator
+
+from ..communication_models import StreamChunk
+from ..protocols import AgentInterface
+
+
+class AgentRuntime(AgentInterface):
+    """Facade that exposes only operational methods from an agent."""
+
+    def __init__(self, agent: AgentInterface):
+        self._agent = agent
+
+    async def invoke(
+        self,
+        user_input: str,
+        owner_id: str = "default",
+        chat_id: str = "default",
+    ) -> str:
+        return await self._agent.invoke(user_input, owner_id=owner_id, chat_id=chat_id)
+
+    async def stream(
+        self,
+        user_input: str,
+        owner_id: str = "default",
+        chat_id: str = "default",
+        include_thinking: bool = False,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        async for chunk in self._agent.stream(
+            user_input,
+            owner_id=owner_id,
+            chat_id=chat_id,
+            include_thinking=include_thinking,
+        ):
+            yield chunk
+
+    def invoke_sync(
+        self,
+        user_input: str,
+        owner_id: str = "default",
+        chat_id: str = "default",
+    ) -> str:
+        return self._agent.invoke_sync(user_input, owner_id=owner_id, chat_id=chat_id)

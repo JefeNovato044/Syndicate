@@ -300,7 +300,7 @@ class GeminiClient(Client):
             raw_response=raw_response
         )
     
-    def _format_tools(self, tools: List[Any]) -> Optional[List[Dict[str, Any]]]:
+    def _format_tools(self, tools: List[Any]) -> Optional[List[Any]]:
         """
         Format tools for Gemini API.
         
@@ -312,19 +312,51 @@ class GeminiClient(Client):
         """
         if not tools:
             return None
-        
-        gemini_tools = []
+
+        function_declarations: List[Any] = []
+        native_tools: List[Any] = []
+
         for tool in tools:
-            # Handle BaseTool instances
             if hasattr(tool, 'to_format'):
                 formatted = tool.to_format(self.provider_type)
                 if formatted is not None:
-                    gemini_tools.append(formatted)
-            # Handle dict or native google.genai.types.Tool directly
+                    if isinstance(formatted, dict) and "name" in formatted:
+                        function_declarations.append(
+                            types.FunctionDeclaration(
+                                name=formatted["name"],
+                                description=formatted.get("description", ""),
+                                parameters=formatted.get("parameters"),
+                            )
+                        )
+                    elif isinstance(formatted, types.Tool) or callable(formatted):
+                        native_tools.append(formatted)
+                    else:
+                        logger.warning(
+                            "Skipping unsupported Gemini tool format from %s: %s",
+                            getattr(tool, "name", tool.__class__.__name__),
+                            type(formatted).__name__,
+                        )
+            elif isinstance(tool, dict) and "name" in tool:
+                function_declarations.append(
+                    types.FunctionDeclaration(
+                        name=tool["name"],
+                        description=tool.get("description", ""),
+                        parameters=tool.get("parameters"),
+                    )
+                )
+            elif isinstance(tool, types.Tool) or callable(tool):
+                native_tools.append(tool)
             elif tool is not None:
-                gemini_tools.append(tool)
-        
-        return gemini_tools if gemini_tools else None
+                logger.warning(
+                    "Skipping unsupported Gemini tool object: %s",
+                    type(tool).__name__,
+                )
+
+        result = list(native_tools)
+        if function_declarations:
+            result.append(types.Tool(function_declarations=function_declarations))
+
+        return result if result else None
     
     async def chat_completion_async(
         self,

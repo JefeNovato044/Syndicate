@@ -321,6 +321,12 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
         with patch("syndicate.clients.gemini.types.ThinkingConfig", side_effect=lambda **kw: kw), patch(
             "syndicate.clients.gemini.types.GenerateContentConfig",
             side_effect=lambda **kw: kw,
+        ), patch(
+            "syndicate.clients.gemini.types.FunctionDeclaration",
+            side_effect=lambda **kw: {"_fd": kw},
+        ), patch(
+            "syndicate.clients.gemini.types.Tool",
+            side_effect=lambda **kw: {"_tool": kw},
         ):
             response = await client.chat_completion_async(
                 messages=[
@@ -340,7 +346,15 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
         call_kwargs = fake_generate.call_args.kwargs
         self.assertEqual(call_kwargs["model"], "gemini-test")
         self.assertEqual(call_kwargs["config"]["system_instruction"], "sys-msg")
-        self.assertEqual(call_kwargs["config"]["tools"], [{"name": "weather_tool"}])
+        tools_payload = call_kwargs["config"]["tools"]
+        self.assertEqual(len(tools_payload), 1)
+        self.assertIn("_tool", tools_payload[0])
+        wrapped_declarations = tools_payload[0]["_tool"]["function_declarations"]
+        self.assertEqual(len(wrapped_declarations), 1)
+        self.assertEqual(
+            wrapped_declarations[0]["_fd"]["name"],
+            "weather_tool",
+        )
         self.assertEqual(call_kwargs["config"]["thinking_config"]["thinking_level"], "medium")
 
         contents = call_kwargs["contents"]
@@ -386,6 +400,45 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(encoded.tool_calls[0].name, "weather")
         self.assertEqual(encoded.tool_calls[0].arguments, {"city": "Tokyo"})
         self.assertEqual(encoded.tool_calls[0].thought_signature, "signature-123")
+
+    def test_format_tools_wraps_function_declarations_and_keeps_native_and_callable(self):
+        client = GeminiClient.__new__(GeminiClient)
+
+        class _FakeTool:
+            def to_format(self, provider_type):
+                self.seen_provider = provider_type
+                return {
+                    "name": "weather_tool",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+
+        class _NativeTool:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        def callable_tool(**kwargs):
+            return "ok"
+        native_tool = _NativeTool(function_declarations=[])
+        fake_tool = _FakeTool()
+
+        with patch("syndicate.clients.gemini.types.FunctionDeclaration", side_effect=lambda **kw: {"_fd": kw}), patch(
+            "syndicate.clients.gemini.types.Tool",
+            _NativeTool,
+        ):
+            formatted = client._format_tools([fake_tool, native_tool, callable_tool])
+
+        self.assertIsNotNone(formatted)
+        self.assertEqual(fake_tool.seen_provider, "gemini")
+        self.assertEqual(len(formatted), 3)
+        self.assertIs(formatted[0], native_tool)
+        self.assertIs(formatted[1], callable_tool)
+        self.assertIsInstance(formatted[2], _NativeTool)
+        self.assertEqual(len(formatted[2].kwargs["function_declarations"]), 1)
+        self.assertEqual(
+            formatted[2].kwargs["function_declarations"][0]["_fd"]["name"],
+            "weather_tool",
+        )
 
 
 class LocalMemoryBehaviorTests(unittest.IsolatedAsyncioTestCase):

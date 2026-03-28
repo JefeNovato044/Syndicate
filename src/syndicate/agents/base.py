@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from collections.abc import AsyncGenerator
 
-from ..communication_models import Message, ToolCall, StreamChunk
+from ..communication_models import Message, ToolCall, StreamChunk, ToolCallEvent
 
 logger = logging.getLogger(__name__)
 
@@ -703,7 +703,83 @@ class BaseAgent(ABC):
             
             # If there are tool calls, execute them and continue the loop
             if accumulated_tool_calls:
-                tool_messages = await self._execute_tools_concurrently(accumulated_tool_calls)
+                # Emit a "start" event for every pending tool call before
+                # dispatching so consumers can show real-time step indicators.
+                for tc in accumulated_tool_calls:
+                    yield StreamChunk(
+                        tool_call=ToolCallEvent(
+                            tool_call_id=tc.id,
+                            tool_name=tc.name,
+                            args=tc.arguments,
+                            status="start",
+                        )
+                    )
+
+                # Execute all tools concurrently.  We need per-call results to
+                # emit individual success/error events, so we fan out manually
+                # instead of going through _execute_tools_concurrently.
+                tool_tasks = [
+                    self.execute_tool(tc.name, **tc.arguments)
+                    for tc in accumulated_tool_calls
+                ]
+                raw_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+
+                tool_messages = []
+                for tc, raw in zip(accumulated_tool_calls, raw_results):
+                    if isinstance(raw, Exception):
+                        content_str = f"Tool error: {str(raw)}"
+                        yield StreamChunk(
+                            tool_call=ToolCallEvent(
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                                args=tc.arguments,
+                                error=str(raw),
+                                status="error",
+                            )
+                        )
+                    elif isinstance(raw, dict):
+                        if raw.get("success"):
+                            content_str = f"Tool '{tc.name}' result: {raw['result']}"
+                            yield StreamChunk(
+                                tool_call=ToolCallEvent(
+                                    tool_call_id=tc.id,
+                                    tool_name=tc.name,
+                                    args=tc.arguments,
+                                    result=raw["result"],
+                                    status="success",
+                                )
+                            )
+                        else:
+                            content_str = f"Tool '{tc.name}' error: {raw['error']}"
+                            yield StreamChunk(
+                                tool_call=ToolCallEvent(
+                                    tool_call_id=tc.id,
+                                    tool_name=tc.name,
+                                    args=tc.arguments,
+                                    error=raw.get("error"),
+                                    status="error",
+                                )
+                            )
+                    else:
+                        content_str = f"Tool result: {raw}"
+                        yield StreamChunk(
+                            tool_call=ToolCallEvent(
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                                args=tc.arguments,
+                                result=raw,
+                                status="success",
+                            )
+                        )
+
+                    tool_messages.append(
+                        Message(
+                            role="tool",
+                            content=content_str,
+                            tool_call_id=tc.id,
+                        )
+                    )
+
                 messages.extend(tool_messages)
                 iteration += 1
                 continue
@@ -832,15 +908,37 @@ class BaseAgent(ABC):
         owner_id: str,
         chat_id: str
     ) -> None:
-        """Store conversation in memory if available."""
+        """Store conversation in memory if available.
+
+        Rollover is checked ONCE before the batch is written, not per-message.
+        This ensures that an agent turn (human + optional tool loop + ai reply)
+        is always stored atomically within a single bucket.  Splitting a
+        functionCall/functionResponse pair across a bucket boundary would corrupt
+        conversation history and cause 400 errors on providers like Gemini that
+        require strict turn ordering.
+        """
         if not self.memory:
             return
         
         try:
-            # Store each message that was part of this interaction
-            # This includes tool calls and results
+            # Check rollover once for the whole batch upfront.
+            # If the threshold is already reached before we write anything,
+            # roll the bucket over now so that every message in this interaction
+            # lands in the fresh bucket together.
+            if (
+                hasattr(self.memory, "rollover_enabled")
+                and self.memory.rollover_enabled
+                and hasattr(self.memory, "should_rollover")
+                and await self.memory.should_rollover(owner_id, chat_id)
+            ):
+                await self.memory.rollover_history(owner_id, chat_id, summarize=True)
+
+            # Write all messages with per-message rollover suppressed so the
+            # batch cannot be split by a second threshold hit mid-loop.
             for msg in messages:
-                await self.memory.add_message(msg, owner_id=owner_id, chat_id=chat_id)
+                await self.memory.add_message(
+                    msg, owner_id=owner_id, chat_id=chat_id, defer_rollover=True
+                )
             
         except Exception as e:
             logger.error(

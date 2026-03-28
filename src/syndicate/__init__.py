@@ -11,6 +11,7 @@ from .communication_models import (
     ToolCall,
     ChatResponse,
     StreamChunk,
+    ToolCallEvent,
 )
 from .protocols import AgentInterface
 
@@ -37,6 +38,7 @@ __all__ = [
     'ToolCall',
     'ChatResponse',
     'StreamChunk',
+    'ToolCallEvent',
     'AgentInterface',
     # Registries
     'AgentRegistry',

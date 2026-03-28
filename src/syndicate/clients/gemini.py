@@ -116,6 +116,10 @@ class GeminiClient(Client):
         - AI messages with tool_calls (function calls with thought_signatures)
         - Tool messages (function responses)
         
+        Orphan-safe: when a bucket rollover splits a function-call/response pair
+        across buckets, the orphaned half is silently dropped so Gemini never sees
+        a functionResponse without a preceding functionCall (or vice-versa).
+        
         Args:
             messages: List of Message objects
             
@@ -126,7 +130,17 @@ class GeminiClient(Client):
         
         chat_messages = []
         system_instruction = None
-        
+        tool_call_id_to_name: Dict[str, str] = {}
+
+        # Pre-scan: collect every tool_call_id that actually has a response in this
+        # history window.  Used below to drop dangling functionCall parts whose
+        # matching functionResponse was rolled into a closed/summarised bucket.
+        tool_response_ids: set = {
+            msg.tool_call_id
+            for msg in messages
+            if msg.role == "tool" and msg.tool_call_id
+        }
+
         for msg in messages:
             # Extract system prompt separately (Gemini uses system_instruction)
             if msg.role == "system":
@@ -142,21 +156,32 @@ class GeminiClient(Client):
             
             # Handle tool (function response) messages
             if msg.role == "tool":
-                # Gemini expects functionResponse in parts with the function NAME
+                tool_call_id = msg.tool_call_id or "unknown"
+                func_name = tool_call_id_to_name.get(tool_call_id)
+
+                if func_name is None:
+                    # Orphaned tool response: the matching ai(tool_calls) message is
+                    # not in this history window (it was in a now-closed/summarised
+                    # bucket).  Sending this to Gemini would produce a
+                    # functionResponse turn with no preceding functionCall turn,
+                    # triggering a 400 INVALID_ARGUMENT.  Drop it instead.
+                    logger.warning(
+                        "_decode_messages: dropping orphaned functionResponse "
+                        "(tool_call_id=%s not found in current history window)",
+                        tool_call_id,
+                    )
+                    continue
+
                 try:
-                    # Try to parse content as JSON for structured response
                     response_data = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
                 except (json.JSONDecodeError, TypeError):
                     response_data = {"result": msg.content}
-                
-                # tool_call_id should be the function name for Gemini compatibility
-                # Format: either "function_name" or kept as-is if it's just the name
-                func_name = msg.tool_call_id or "unknown"
                 
                 chat_messages.append({
                     "role": "user",
                     "parts": [{
                         "functionResponse": {
+                            "id": tool_call_id,
                             "name": func_name,
                             "response": response_data
                         }
@@ -166,14 +191,33 @@ class GeminiClient(Client):
             
             # Handle AI messages with tool calls (function calls)
             if msg.role == "ai" and msg.tool_calls:
+                # Only include tool calls whose response is present in this history
+                # window.  If a rollover stored the matching tool response in a
+                # different (now-closed) bucket, including the functionCall here
+                # without a following functionResponse would also break Gemini's
+                # strict turn-ordering rules.
+                matched_calls = [tc for tc in msg.tool_calls if tc.id in tool_response_ids]
+
+                if not matched_calls:
+                    # Every tool call in this turn is dangling — no responses in
+                    # the visible history.  Skip the entire model turn.
+                    logger.warning(
+                        "_decode_messages: dropping ai message with %d dangling "
+                        "tool_call(s) (no matching responses in history window)",
+                        len(msg.tool_calls),
+                    )
+                    continue
+
                 parts = []
-                for tc in msg.tool_calls:
+                for tc in matched_calls:
                     fc_part = {
                         "functionCall": {
+                            "id": tc.id,
                             "name": tc.name,
                             "args": tc.arguments
                         }
                     }
+                    tool_call_id_to_name[tc.id] = tc.name
                     # Preserve thought_signature for Gemini 3+ (REQUIRED for multi-turn)
                     if tc.thought_signature:
                         fc_part["thoughtSignature"] = tc.thought_signature
@@ -278,10 +322,10 @@ class GeminiClient(Client):
                             if hasattr(part, 'thought_signature') and part.thought_signature:
                                 thought_sig = part.thought_signature
                             
-                            # Use function name as ID for Gemini compatibility
-                            # (Gemini requires name in functionResponse, not arbitrary ID)
+                            # Preserve provider tool call id for Gemini 3 multi-turn mapping.
+                            tool_call_id = getattr(fc, 'id', None) or func_name
                             tool_calls.append(ToolCall(
-                                id=func_name,  # Use name as ID for Gemini
+                                id=tool_call_id,
                                 name=func_name,
                                 arguments=func_args,
                                 thought_signature=thought_sig
@@ -529,8 +573,9 @@ class GeminiClient(Client):
                                     thought_sig = part.thought_signature
                                 
                                 # Use function name as ID for Gemini compatibility
+                                tool_call_id = getattr(fc, 'id', None) or func_name
                                 tool_calls.append(ToolCall(
-                                    id=func_name,
+                                    id=tool_call_id,
                                     name=func_name,
                                     arguments=func_args,
                                     thought_signature=thought_sig

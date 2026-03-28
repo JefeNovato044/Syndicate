@@ -15,6 +15,8 @@ def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
     Gemini does not accept: additionalProperties, title, $defs, definitions.
     Applied recursively to nested property schemas, array items, and combinators.
     """
+    schema = _resolve_local_refs_for_gemini(dict(schema))
+
     schema = dict(schema)
     for field in ("additionalProperties", "title", "$defs", "definitions"):
         schema.pop(field, None)
@@ -30,11 +32,100 @@ def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
 
     for combinator in ("oneOf", "anyOf", "allOf"):
         if combinator in schema and isinstance(schema[combinator], list):
-            schema[combinator] = [
-                _clean_schema_for_gemini(s) for s in schema[combinator] if isinstance(s, dict)
+            options = [
+                _clean_schema_for_gemini(s)
+                for s in schema[combinator]
+                if isinstance(s, dict)
             ]
+            replacement = _collapse_gemini_combinator_options(options)
+            schema.pop(combinator, None)
+            if replacement:
+                for key, value in replacement.items():
+                    if key == "nullable":
+                        schema[key] = bool(schema.get(key, False) or value)
+                    elif key not in schema:
+                        schema[key] = value
 
     return schema
+
+
+def _is_null_schema(schema: Dict[str, Any]) -> bool:
+    return schema.get("type") == "null" or schema.get("enum") == [None]
+
+
+def _collapse_gemini_combinator_options(options: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collapse unsupported OpenAPI combinators to Gemini-compatible schema.
+
+    Gemini function declarations reject `oneOf`/`anyOf`/`allOf` in parameters.
+    We preserve the common nullable-union shape (T | null) by converting it to
+    `{..., "nullable": true}`. For other unions, we fall back to the first
+    non-null branch to keep schema validation strict and accepted by Gemini.
+    """
+    if not options:
+        return {}
+
+    nullable = any(_is_null_schema(option) for option in options)
+    non_null_options = [option for option in options if not _is_null_schema(option)]
+
+    if not non_null_options:
+        return {"type": "string", "nullable": True}
+
+    selected = dict(non_null_options[0])
+    if nullable:
+        selected["nullable"] = True
+
+    return selected
+
+
+def _resolve_local_refs_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve local JSON Schema refs (``#/$defs/...`` and ``#/definitions/...``).
+
+    Gemini's FunctionDeclaration rejects raw ``$ref`` fields in parameters,
+    so we inline local refs before final schema cleaning.
+    """
+    defs: Dict[str, Any] = {}
+    defs.update(schema.get("$defs", {}) or {})
+    defs.update(schema.get("definitions", {}) or {})
+
+    def _resolve(node: Any, stack: Optional[List[str]] = None) -> Any:
+        stack = stack or []
+
+        if isinstance(node, list):
+            return [_resolve(item, stack) for item in node]
+
+        if not isinstance(node, dict):
+            return node
+
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            ref_key = None
+            if ref.startswith("#/$defs/"):
+                ref_key = ref.split("#/$defs/", 1)[1]
+            elif ref.startswith("#/definitions/"):
+                ref_key = ref.split("#/definitions/", 1)[1]
+
+            if ref_key and ref_key in defs and ref_key not in stack:
+                target = defs[ref_key]
+                if isinstance(target, dict):
+                    merged = dict(target)
+                    for k, v in node.items():
+                        if k != "$ref":
+                            merged[k] = v
+                    return _resolve(merged, stack + [ref_key])
+
+            # Unresolvable or recursive ref: drop $ref to avoid Gemini validation errors.
+            return {
+                k: _resolve(v, stack)
+                for k, v in node.items()
+                if k != "$ref"
+            }
+
+        return {
+            k: _resolve(v, stack)
+            for k, v in node.items()
+        }
+
+    return _resolve(schema)
 
 
 class BaseTool(ABC):

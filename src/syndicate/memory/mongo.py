@@ -165,8 +165,11 @@ class MongoMemory(BaseChatMemory):
         if bucket is None:
             bucket = await self.create_bucket(owner_id, chat_id)
 
-        # Check for rollover if enabled
-        if self.rollover_enabled:
+        # Check for rollover if enabled.
+        # defer_rollover=True means the caller (e.g. _store_interaction) already
+        # handled the rollover check once for the whole batch; skip it here to
+        # prevent a bucket split mid-interaction.
+        if self.rollover_enabled and not kwargs.get("defer_rollover", False):
             if await self.should_rollover(owner_id, chat_id):
                 logger.info(
                     "[MongoMemory] Triggering rollover for %s/%s - bucket full",

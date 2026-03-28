@@ -20,6 +20,7 @@ from syndicate.memory.mongo import MongoMemory
 from syndicate.memory.sqlite_postgres import SqlitePostgresMemory
 from syndicate.mcp import MCPSubTool
 from syndicate.tools.agent_tool import AgentAsTool
+from syndicate.tools.base_tool import _clean_schema_for_gemini
 
 
 class _FakeDelegatedAgent:
@@ -273,7 +274,8 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ],
             ),
-            Message(role="tool", content="NOT_JSON", tool_call_id="weather"),
+            # tool_call_id must match ToolCall.id so the pair isn't treated as orphaned
+            Message(role="tool", content="NOT_JSON", tool_call_id="weather_id"),
         ]
 
         decoded, system_instruction = client._decode_messages(messages)
@@ -296,6 +298,128 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
             decoded[2]["parts"][0]["functionResponse"]["response"],
             {"result": "NOT_JSON"},
         )
+
+    def test_decode_messages_links_function_response_with_call_id_and_name(self):
+        client = GeminiClient.__new__(GeminiClient)
+
+        messages = [
+            Message(
+                role="ai",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call_abc123",
+                        name="create_work_center",
+                        arguments={"name": "X"},
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                content='{"ok": true}',
+                tool_call_id="call_abc123",
+            ),
+        ]
+
+        decoded, _ = client._decode_messages(messages)
+
+        function_call = decoded[0]["parts"][0]["functionCall"]
+        function_response = decoded[1]["parts"][0]["functionResponse"]
+
+        self.assertEqual(function_call["id"], "call_abc123")
+        self.assertEqual(function_call["name"], "create_work_center")
+        self.assertEqual(function_response["id"], "call_abc123")
+        self.assertEqual(function_response["name"], "create_work_center")
+
+    def test_decode_messages_drops_orphaned_tool_response_from_closed_bucket(self):
+        """Regression: bucket rollover may store ai(tool_calls) in bucket N and the
+        matching tool response in bucket N+1.  get_history only returns the active
+        bucket, so the tool response appears without a preceding functionCall.
+        _decode_messages must silently drop it to avoid a 400 INVALID_ARGUMENT."""
+        client = GeminiClient.__new__(GeminiClient)
+
+        # Simulates what MongoMemory.get_history returns when the ai(tool_calls)
+        # message for id '8dwjxazu' rolled over into a closed bucket (summarised)
+        # and only the tool response survived in the active bucket.
+        messages = [
+            # Context summary injected from the closed bucket (no functionCall here)
+            Message(role="system", content="Previous context: user asked to create a doc"),
+            # Orphaned tool response — its ai(tool_calls) is in the closed bucket
+            Message(role="tool", content='{"error": "internal"}', tool_call_id="8dwjxazu"),
+            # Next iteration: properly paired call + response
+            Message(
+                role="ai",
+                content="",
+                tool_calls=[ToolCall(id="7w5yt56j", name="CreateDocument", arguments={})],
+            ),
+            Message(role="tool", content='{"error": "internal 2"}', tool_call_id="7w5yt56j"),
+            # Final text turn
+            Message(role="ai", content="Sorry, I can't create the doc right now."),
+            # New user message appended by _build_messages
+            Message(role="human", content="Can you show me the payload you used?"),
+        ]
+
+        decoded, system_instruction = client._decode_messages(messages)
+
+        # System message captured separately
+        self.assertIn("Previous context", system_instruction)
+
+        # The orphaned tool response must NOT appear in the Gemini history
+        roles = [m["role"] for m in decoded]
+        parts_flat = [p for m in decoded for p in m["parts"]]
+        func_responses = [p for p in parts_flat if "functionResponse" in p]
+        orphan_ids = [r["functionResponse"]["id"] for r in func_responses if r["functionResponse"]["id"] == "8dwjxazu"]
+        self.assertEqual(orphan_ids, [], "Orphaned functionResponse must be dropped")
+
+        # The paired call/response for 7w5yt56j must be present and ordered correctly
+        model_calls = [m for m in decoded if m["role"] == "model" and any("functionCall" in p for p in m["parts"])]
+        user_responses = [m for m in decoded if m["role"] == "user" and any("functionResponse" in p for p in m["parts"])]
+        self.assertEqual(len(model_calls), 1)
+        self.assertEqual(len(user_responses), 1)
+        self.assertEqual(model_calls[0]["parts"][0]["functionCall"]["id"], "7w5yt56j")
+        self.assertEqual(user_responses[0]["parts"][0]["functionResponse"]["id"], "7w5yt56j")
+
+        # The model call must immediately precede the user response in the list
+        call_idx = decoded.index(model_calls[0])
+        response_idx = decoded.index(user_responses[0])
+        self.assertEqual(response_idx, call_idx + 1, "functionResponse must follow functionCall immediately")
+
+    def test_decode_messages_drops_dangling_ai_tool_calls_without_responses(self):
+        """Regression: if ai(tool_calls) is stored in the active bucket but its tool
+        responses are absent (e.g. another mid-batch rollover edge case), the
+        dangling functionCall must also be dropped so Gemini never sees a
+        functionCall turn with no following functionResponse."""
+        client = GeminiClient.__new__(GeminiClient)
+
+        messages = [
+            Message(role="human", content="Do something"),
+            # Dangling: tool call made, but response never stored (all IDs absent from history)
+            Message(
+                role="ai",
+                content="",
+                tool_calls=[ToolCall(id="dangling_id", name="DoThing", arguments={})],
+            ),
+            # Subsequent normal text response
+            Message(role="ai", content="Something went wrong, try again."),
+            Message(role="human", content="OK try again"),
+        ]
+
+        decoded, _ = client._decode_messages(messages)
+
+        # The dangling functionCall model turn must be absent
+        func_calls = [
+            p
+            for m in decoded
+            for p in m["parts"]
+            if "functionCall" in p
+        ]
+        self.assertEqual(func_calls, [], "Dangling functionCall must be dropped")
+
+        # Normal text turns should survive
+        text_parts = [p["text"] for m in decoded for p in m["parts"] if "text" in p]
+        self.assertIn("Do something", text_parts)
+        self.assertIn("Something went wrong, try again.", text_parts)
+        self.assertIn("OK try again", text_parts)
 
     async def test_chat_completion_async_builds_image_tools_and_thinking_config(self):
         client = GeminiClient.__new__(GeminiClient)
@@ -401,6 +525,48 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(encoded.tool_calls[0].arguments, {"city": "Tokyo"})
         self.assertEqual(encoded.tool_calls[0].thought_signature, "signature-123")
 
+    def test_encode_response_preserves_function_call_id(self):
+        client = GeminiClient.__new__(GeminiClient)
+
+        function_call = SimpleNamespace(id="call_xyz789", name="weather", args={"city": "Tokyo"})
+        part = SimpleNamespace(
+            text="",
+            thought=None,
+            function_call=function_call,
+            thought_signature=None,
+        )
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[part]),
+            finish_reason="STOP",
+        )
+        raw = SimpleNamespace(candidates=[candidate], usage_metadata=SimpleNamespace())
+
+        encoded = client._encode_response(raw)
+
+        self.assertIsNotNone(encoded.tool_calls)
+        self.assertEqual(encoded.tool_calls[0].id, "call_xyz789")
+
+    def test_encode_response_accepts_bytes_thought_signature(self):
+        client = GeminiClient.__new__(GeminiClient)
+
+        function_call = SimpleNamespace(name="weather", args={"city": "Tokyo"})
+        part = SimpleNamespace(
+            text="",
+            thought=None,
+            function_call=function_call,
+            thought_signature=b"\x12\x97sig-bytes",
+        )
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[part]),
+            finish_reason="STOP",
+        )
+        raw = SimpleNamespace(candidates=[candidate], usage_metadata=SimpleNamespace())
+
+        encoded = client._encode_response(raw)
+
+        self.assertIsNotNone(encoded.tool_calls)
+        self.assertEqual(encoded.tool_calls[0].thought_signature, b"\x12\x97sig-bytes")
+
     def test_format_tools_wraps_function_declarations_and_keeps_native_and_callable(self):
         client = GeminiClient.__new__(GeminiClient)
 
@@ -442,6 +608,62 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalMemoryBehaviorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rollover_does_not_split_tool_call_pair_across_buckets(self):
+        """Regression: rollover must fire at turn boundary, not mid-interaction.
+
+        If the threshold fires after the ai(tool_calls) message is stored (i.e.
+        the bucket is already full when _store_interaction begins), the rollover
+        must happen BEFORE writing any messages in the new batch so that the entire
+        human → ai(tool_calls) → tool(result) → ai(text) sequence lands in one bucket.
+        """
+        # Threshold of 1 interaction = 2 messages.  We prime the bucket with one
+        # completed interaction so it is exactly at threshold before the tool-call
+        # batch arrives.
+        memory = LocalMemory(
+            rollover_enabled=True,
+            max_interactions_per_bucket=1,
+            preserve_closed_buckets=True,
+        )
+        # Prime: fill bucket 0 to threshold
+        await memory.add_message(Message(role="human", content="ping"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="pong"), "owner", "chat")
+
+        # Now simulate _store_interaction writing a tool-call turn as a batch.
+        # With defer_rollover=True the bucket must NOT split mid-batch.
+        # We replicate exactly what _store_interaction does after the upfront rollover.
+        if await memory.should_rollover("owner", "chat"):
+            await memory.rollover_history("owner", "chat", summarize=False)
+
+        tool_call_batch = [
+            Message(role="human", content="create doc"),
+            Message(
+                role="ai",
+                content="",
+                tool_calls=[ToolCall(id="tcid1", name="CreateDoc", arguments={})],
+            ),
+            Message(role="tool", content='{"ok": true}', tool_call_id="tcid1"),
+            Message(role="ai", content="Done!"),
+        ]
+        for msg in tool_call_batch:
+            await memory.add_message(msg, "owner", "chat", defer_rollover=True)
+
+        # The entire 4-message batch must be in a single active bucket
+        active = await memory.get_active_bucket("owner", "chat")
+        self.assertIsNotNone(active)
+        roles = [m.role for m in active.messages]
+        self.assertEqual(
+            roles,
+            ["human", "ai", "tool", "ai"],
+            "ai(tool_calls) and tool(result) must be in the same bucket",
+        )
+
+        # The tool call and its response must both be present
+        tool_call_msg = next((m for m in active.messages if m.tool_calls), None)
+        tool_result_msg = next((m for m in active.messages if m.role == "tool"), None)
+        self.assertIsNotNone(tool_call_msg)
+        self.assertIsNotNone(tool_result_msg)
+        self.assertEqual(tool_result_msg.tool_call_id, tool_call_msg.tool_calls[0].id)
+
     async def test_rollover_preserves_closed_bucket_when_enabled(self):
         memory = LocalMemory(
             rollover_enabled=True,
@@ -671,6 +893,171 @@ class AgentInterfaceAndRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(runtime_a, runtime_b)
         self.assertTrue(isinstance(runtime_a, AgentInterface))
+
+
+class GeminiSchemaCleaningTests(unittest.TestCase):
+    def test_clean_schema_resolves_local_ref_from_definitions(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "input": {
+                    "$ref": "#/definitions/UpdateWorkCenterDataInput"
+                }
+            },
+            "definitions": {
+                "UpdateWorkCenterDataInput": {
+                    "type": "object",
+                    "title": "UpdateWorkCenterDataInput",
+                    "properties": {
+                        "name": {"type": "string", "title": "Name"}
+                    },
+                    "required": ["name"],
+                }
+            },
+        }
+
+        cleaned = _clean_schema_for_gemini(schema)
+
+        self.assertNotIn("definitions", cleaned)
+        self.assertIn("properties", cleaned)
+        self.assertIn("input", cleaned["properties"])
+        self.assertNotIn("$ref", cleaned["properties"]["input"])
+        self.assertEqual(cleaned["properties"]["input"]["type"], "object")
+        self.assertIn("name", cleaned["properties"]["input"]["properties"])
+
+    def test_clean_schema_collapses_oneof_nullable_array_items(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "employees": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "null"},
+                        ]
+                    },
+                }
+            },
+        }
+
+        cleaned = _clean_schema_for_gemini(schema)
+        item_schema = cleaned["properties"]["employees"]["items"]
+
+        self.assertNotIn("oneOf", item_schema)
+        self.assertEqual(item_schema.get("type"), "string")
+        self.assertTrue(item_schema.get("nullable"))
+
+
+class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
+    """Tests that _orchestrate_stream emits ToolCallEvent chunks around tool dispatch."""
+
+    def _make_agent(self, tool_result, tool_error=None):
+        """Build a minimal BaseAgent wired with a fake LLM and a fake tool."""
+        from syndicate.communication_models import ToolCallEvent
+
+        # One-shot LLM: first call returns a tool_call, second returns final text
+        call_count = {"n": 0}
+
+        class _FakeLLM:
+            provider_type = "openai"
+
+            async def chat_completion_stream(self, messages, system_message, tools=None, **kw):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    # First turn: yield a tool call
+                    yield StreamChunk(
+                        tool_calls=[ToolCall(id="ev_id_1", name="fake_tool", arguments={"x": 1})],
+                        is_finished=True,
+                        finish_reason="tool_calls",
+                    )
+                else:
+                    # Second turn: final text
+                    yield StreamChunk(content="done", is_finished=True, finish_reason="stop")
+
+        class _FakeTool:
+            name = "fake_tool"
+
+            async def run_async(self, **kwargs):
+                if tool_error:
+                    raise RuntimeError(tool_error)
+                return tool_result
+
+        memory = LocalMemory()
+        agent = BaseAgent.__new__(BaseAgent)
+        agent.llm = _FakeLLM()
+        agent.memory = memory
+        agent.name = "TestAgent"
+        agent.system_prompt = "sys"
+        agent.tools = [_FakeTool()]
+        agent.max_iterations = 5
+        agent.skills = []
+        agent._as_tool_cache = None
+        agent._as_runtime_cache = None
+        from contextvars import ContextVar
+        agent._request_system_prompt_ctx = ContextVar("sp", default=None)
+        agent._request_formatted_tools_ctx = ContextVar("ft", default=None)
+        agent._request_tool_map_ctx = ContextVar("tm", default=None)
+        return agent
+
+    async def test_stream_emits_start_and_success_events(self):
+        from syndicate.communication_models import ToolCallEvent
+
+        agent = self._make_agent(tool_result="tool_output")
+
+        messages = [Message(role="human", content="go")]
+        chunks = []
+        async for chunk in agent._orchestrate_stream(messages):
+            chunks.append(chunk)
+
+        tool_events = [c for c in chunks if c.tool_call is not None]
+        self.assertEqual(len(tool_events), 2, "Expected start + success events")
+
+        start_evt = tool_events[0].tool_call
+        success_evt = tool_events[1].tool_call
+
+        self.assertEqual(start_evt.status, "start")
+        self.assertEqual(start_evt.tool_name, "fake_tool")
+        self.assertEqual(start_evt.tool_call_id, "ev_id_1")
+        self.assertEqual(start_evt.args, {"x": 1})
+        self.assertIsNone(start_evt.result)
+
+        self.assertEqual(success_evt.status, "success")
+        self.assertEqual(success_evt.tool_name, "fake_tool")
+        self.assertEqual(success_evt.tool_call_id, "ev_id_1")
+        self.assertEqual(success_evt.result, "tool_output")
+
+        # Final text chunk must also arrive
+        text_chunks = [c for c in chunks if c.content]
+        self.assertTrue(any(c.content == "done" for c in text_chunks))
+
+    async def test_stream_emits_error_event_on_tool_failure(self):
+        agent = self._make_agent(tool_result=None, tool_error="boom")
+
+        messages = [Message(role="human", content="go")]
+        chunks = []
+        async for chunk in agent._orchestrate_stream(messages):
+            chunks.append(chunk)
+
+        tool_events = [c for c in chunks if c.tool_call is not None]
+        statuses = [e.tool_call.status for e in tool_events]
+        self.assertIn("start", statuses)
+        self.assertIn("error", statuses)
+
+        error_evt = next(e.tool_call for e in tool_events if e.tool_call.status == "error")
+        self.assertEqual(error_evt.tool_name, "fake_tool")
+        self.assertIsNotNone(error_evt.error)
+
+    async def test_existing_content_chunks_unaffected(self):
+        """Consumers that only read chunk.content must receive an unbroken stream."""
+        agent = self._make_agent(tool_result="r")
+
+        messages = [Message(role="human", content="go")]
+        content = ""
+        async for chunk in agent._orchestrate_stream(messages):
+            content += chunk.content  # tool_call chunks have content="" by default
+
+        self.assertEqual(content, "done")
 
 
 if __name__ == "__main__":

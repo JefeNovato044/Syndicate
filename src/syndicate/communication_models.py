@@ -146,7 +146,7 @@ class ToolCall(BaseModel):
     id: str = Field(..., description="Unique identifier for this tool call")
     name: str = Field(..., description="Name of the tool/function to call")
     arguments: Dict[str, Any] = Field(..., description="Arguments for the tool")
-    thought_signature: Optional[str] = Field(
+    thought_signature: Optional[bytes | str] = Field(
         None, 
         description="Encrypted thinking state signature (Gemini 3+). Must be preserved and sent back for multi-turn function calling."
     )
@@ -187,6 +187,28 @@ class ChatResponse(BaseModel):
         )
 
 
+class ToolCallEvent(BaseModel):
+    """
+    Event emitted by the streaming orchestrator when a tool is dispatched or completes.
+
+    Consumers can use these to drive real-time UI step indicators without
+    monkey-patching tools or polling a side-channel bus.
+
+    Two chunks are emitted per tool call:
+      1. status="start"   — immediately before execution begins
+      2. status="success" or status="error" — immediately after execution completes
+
+    ``tool_call_id`` matches the LLM's original ToolCall.id, enabling correlation
+    when multiple tools run concurrently.
+    """
+    tool_call_id: str = Field(..., description="ID of the originating ToolCall (for correlation)")
+    tool_name: str = Field(..., description="Name of the tool being called")
+    args: Dict[str, Any] = Field(default_factory=dict, description="Arguments passed to the tool")
+    result: Optional[Any] = Field(None, description="Tool result (set on success/error)")
+    error: Optional[str] = Field(None, description="Error message if status='error'")
+    status: Literal["start", "success", "error"] = Field(..., description="Lifecycle phase of this event")
+
+
 class StreamChunk(BaseModel):
     """
     Single chunk of streaming content from an LLM.
@@ -204,8 +226,12 @@ class StreamChunk(BaseModel):
         description="Tool/function calls requested by the LLM during streaming"
     )
 
+    # Emitted during tool dispatch phases — None for normal content/thinking chunks
+    tool_call: Optional[ToolCallEvent] = Field(
+        None,
+        description="Tool lifecycle event (start/success/error). None for content chunks."
+    )
 
-    
     # Provider-agnostic usage stats (tokens used) injected on the final chunk
     usage: Optional[Dict[str, int]] = Field(default=None)
     

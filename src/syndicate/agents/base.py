@@ -343,7 +343,8 @@ class BaseAgent(ABC):
         Synchronous wrapper for invoke() for quick prototyping and testing.
         
         Must be called from a synchronous context (no running event loop).
-        For async contexts, use `await agent.invoke(...)` directly.
+        Also works from interactive environments with a running loop (e.g. Jupyter
+        notebooks) by delegating to a background thread.
         
         Args:
             user_input: The user's message
@@ -353,22 +354,22 @@ class BaseAgent(ABC):
         Returns:
             The agent's response as a string
             
-        Raises:
-            RuntimeError: If called from within a running async event loop.
-            
         Example:
             response = agent.invoke_sync("What's the weather?")
         """
+        import concurrent.futures
+
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # No event loop running — safe to use asyncio.run()
+            # No event loop running — safe to use asyncio.run() directly.
             return asyncio.run(self.invoke(user_input, owner_id, chat_id))
-        
-        raise RuntimeError(
-            "invoke_sync() cannot be called from an async context. "
-            "Use `await agent.invoke(...)` instead."
-        )
+
+        # A loop is already running (e.g. Jupyter / IPython kernel).
+        # Spin up a worker thread with its own event loop to avoid nesting.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, self.invoke(user_input, owner_id, chat_id))
+            return future.result()
     
     async def stream(
         self,

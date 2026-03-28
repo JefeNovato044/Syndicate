@@ -45,8 +45,8 @@ class OpenAIClient(Client):
         base_url: str,
         api_key: str = "dummy",
         model_name: str = "llama3",
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
         timeout: int = 120
     ):
         """
@@ -56,8 +56,8 @@ class OpenAIClient(Client):
             base_url: Base URL of the API endpoint (e.g., "http://localhost:11434/v1")
             api_key: API key (for OpenAI, Ollama uses "ollama" or any string)
             model_name: Name of the model to use
-            temperature: Sampling temperature (0.0 to 2.0)
-            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0.0 to 2.0). If None, the server default is used.
+            max_tokens: Maximum tokens to generate. If None, the server default is used.
             timeout: Request timeout in seconds
         """
         self.base_url = base_url.rstrip('/')
@@ -257,14 +257,19 @@ class OpenAIClient(Client):
         # Format tools if provided
         formatted_tools = self._format_tools(tools)
         
-        # Build request payload
-        payload = {
+        # Build request payload — only include optional params when explicitly set
+        # so the server's own defaults are preserved.
+        payload: Dict[str, Any] = {
             "model": self.model_name,
             "messages": openai_messages,
-            "temperature": kwargs.get("temperature", self.temperature),
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens)
         }
-        
+        temperature = kwargs.get("temperature", self.temperature)
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
         # Add tools if provided
         if formatted_tools:
             payload["tools"] = formatted_tools
@@ -272,10 +277,17 @@ class OpenAIClient(Client):
         
         # Make async request using persistent client
         client = self._get_async_client()
-        response = await client.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-        )
+        try:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+            )
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            raise TimeoutError(
+                f"[OpenAIClient] Request to {self.base_url} timed out after {self.timeout}s "
+                f"while waiting for model '{self.model_name}'. "
+                f"Increase the timeout via OpenAIClient(timeout=...) or check that the server is responsive."
+            ) from exc
         response.raise_for_status()
         
         # Encode to our ChatResponse format
@@ -313,14 +325,19 @@ class OpenAIClient(Client):
         # Format tools if provided
         formatted_tools = self._format_tools(tools)
         
-        # Build request payload
-        payload = {
+        # Build request payload — only include optional params when explicitly set
+        # so the server's own defaults are preserved.
+        payload: Dict[str, Any] = {
             "model": self.model_name,
             "messages": openai_messages,
-            "temperature": kwargs.get("temperature", self.temperature),
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
-            "stream": True  # Enable streaming
+            "stream": True,
         }
+        temperature = kwargs.get("temperature", self.temperature)
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         
         # Add tools if provided
         if formatted_tools:
@@ -364,82 +381,91 @@ class OpenAIClient(Client):
                 )
             return final_tool_calls
 
-        async with client.stream(
-            "POST",
-            f"{self.base_url}/chat/completions",
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            
-            # Parse SSE (Server-Sent Events) format
-            async for line in response.aiter_lines():
-                if not line.strip():
-                    continue
+        try:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                json=payload,
+            ) as response:
+                response.raise_for_status()
                 
-                # SSE format: "data: {...}"
-                if line.startswith("data: "):
-                    data_str = line[6:]  # Remove "data: " prefix
-                    # Handle [DONE] marker
-                    if data_str.strip() == "[DONE]":
-                        # Emit accumulated tool calls as complete ToolCall objects
-                        final_tool_calls = _build_final_tool_calls()
-                        yield StreamChunk(
-                            content="",
-                            is_finished=True,
-                            finish_reason=last_finish_reason or ("tool_calls" if final_tool_calls else "stop"),
-                            tool_calls=final_tool_calls,
-                        )
-                        emitted_terminal_chunk = True
-                        break
-                    
-                    try:
-                        data = json.loads(data_str)
-                        
-                        # Extract content from delta
-                        content = ""
-                        thinking = ""
-                        finish_reason = None
-
-                        if "choices" in data and len(data["choices"]) > 0:
-                            choice = data["choices"][0]
-                            delta = choice.get("delta", {})
-                            finish_reason = choice.get("finish_reason")
-                            if finish_reason is not None:
-                                last_finish_reason = finish_reason
-
-                            if delta:
-                                content = delta.get("content", "") or ""
-                                thinking = delta.get("reasoning_content", "") or ""
-
-                                # Accumulate tool call deltas by index
-                                for tc_delta in delta.get("tool_calls", []):
-                                    idx = tc_delta.get("index", 0)
-                                    if idx not in _tool_call_acc:
-                                        _tool_call_acc[idx] = {"id": "", "name": "", "arguments": ""}
-                                    if tc_delta.get("id"):
-                                        _tool_call_acc[idx]["id"] = tc_delta["id"]
-                                    func = tc_delta.get("function", {})
-                                    if func.get("name"):
-                                        _tool_call_acc[idx]["name"] = func["name"]
-                                    if func.get("arguments"):
-                                        _tool_call_acc[idx]["arguments"] += func["arguments"]
-
-                                role = delta.get("role", "")
-                                if not content and not thinking and role and not delta.get("tool_calls"):
-                                    continue
-
-                        # Yield content/thinking chunks (tool calls emitted on [DONE])
-                        if content or thinking or finish_reason:
-                            yield StreamChunk(
-                                content=content,
-                                thinking=thinking,
-                                is_finished=(finish_reason is not None and finish_reason != "tool_calls"),
-                                finish_reason=finish_reason,
-                            )
-
-                    except json.JSONDecodeError:
-                        # Skip invalid JSON
+                # Parse SSE (Server-Sent Events) format
+                async for line in response.aiter_lines():
+                    if not line.strip():
                         continue
+                    
+                    # SSE format: "data: {...}"
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+                        # Handle [DONE] marker
+                        if data_str.strip() == "[DONE]":
+                            # Emit accumulated tool calls as complete ToolCall objects
+                            final_tool_calls = _build_final_tool_calls()
+                            yield StreamChunk(
+                                content="",
+                                is_finished=True,
+                                finish_reason=last_finish_reason or ("tool_calls" if final_tool_calls else "stop"),
+                                tool_calls=final_tool_calls,
+                            )
+                            emitted_terminal_chunk = True
+                            break
+                        
+                        try:
+                            data = json.loads(data_str)
+                            
+                            # Extract content from delta
+                            content = ""
+                            thinking = ""
+                            finish_reason = None
+
+                            if "choices" in data and len(data["choices"]) > 0:
+                                choice = data["choices"][0]
+                                delta = choice.get("delta", {})
+                                finish_reason = choice.get("finish_reason")
+                                if finish_reason is not None:
+                                    last_finish_reason = finish_reason
+
+                                if delta:
+                                    content = delta.get("content", "") or ""
+                                    thinking = delta.get("reasoning_content", "") or ""
+
+                                    # Accumulate tool call deltas by index
+                                    for tc_delta in delta.get("tool_calls", []):
+                                        idx = tc_delta.get("index", 0)
+                                        if idx not in _tool_call_acc:
+                                            _tool_call_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                                        if tc_delta.get("id"):
+                                            _tool_call_acc[idx]["id"] = tc_delta["id"]
+                                        func = tc_delta.get("function", {})
+                                        if func.get("name"):
+                                            _tool_call_acc[idx]["name"] = func["name"]
+                                        if func.get("arguments"):
+                                            _tool_call_acc[idx]["arguments"] += func["arguments"]
+
+                                    role = delta.get("role", "")
+                                    if not content and not thinking and role and not delta.get("tool_calls"):
+                                        continue
+
+                            # Yield content/thinking chunks (tool calls emitted on [DONE])
+                            if content or thinking or finish_reason:
+                                yield StreamChunk(
+                                    content=content,
+                                    thinking=thinking,
+                                    is_finished=(finish_reason is not None and finish_reason != "tool_calls"),
+                                    finish_reason=finish_reason,
+                                )
+
+                        except json.JSONDecodeError:
+                            # Skip invalid JSON
+                            continue
+
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as exc:
+            raise TimeoutError(
+                f"[OpenAIClient] Request to '{self.base_url}' timed out after {self.timeout}s "
+                f"waiting for model '{self.model_name}'. "
+                f"Increase the timeout via OpenAIClient(timeout=<seconds>) "
+                f"or check that the server is responsive."
+            ) from exc
 
         # If stream ended unexpectedly without [DONE], flush tool calls so they
         # are not silently lost by downstream orchestration.

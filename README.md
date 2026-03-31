@@ -6,13 +6,63 @@
 
 **"Just plug in. No wiring needed."**
 
-Syndicate embraces a motherboard design philosophy where components auto-configure based on what's connected. Think of it like Cyberpunk 2077's neural skill chips: plug in a module, instantly gain domain expertise without training or fine-tuning.
+Syndicate embraces a motherboard design philosophy where components auto-configure based on what's connected. The core inspiration comes from Cyberpunk 2077 neural chips and cyberware systems: abilities are installed, upgraded, and combined without rebuilding the whole body.
+
+That idea maps directly to the framework design: skills, tools, memory backends, and model providers can be plugged in or swapped with minimal friction. You compose capabilities like a cyberware loadout while keeping a stable core runtime.
 
 The framework prioritizes:
 - **Zero-boilerplate setup** - Components auto-detect and configure themselves
 - **Modularity** - Swap components in/out at runtime
 - **Provider-agnostic** - Works with any LLM provider (Gemini, OpenAI, Ollama, LM Studio, vLLM, …)
 - **Extensibility** - Add skills, tools, and memory implementations easily
+
+## Requirements
+
+- **Python 3.10+** (Compatible with most modern AI/ML libraries)
+- **Recommended runtime: Python 3.11**
+- LLM API Key (OpenAI, Gemini) or local provider (Ollama)
+
+## Installation
+
+```bash
+# Using uv (recommended)
+uv sync
+
+# Or with pip
+pip install -e .
+```
+
+### Optional Extras
+
+| Use Case | Install Command |
+|----------|-----------------|
+| PostgreSQL memory backend | `pip install "syndicate[postgres]"` |
+| RAG with local embeddings (`sentence-transformers`) | `pip install "syndicate[rag]"` |
+| RAG with OpenAI embeddings | `pip install "syndicate[rag,embeddings-openai]"` |
+| RAG with Gemini embeddings | `pip install "syndicate[rag,embeddings-gemini]"` |
+| RAG with Cohere embeddings | `pip install "syndicate[rag,embeddings-cohere]"` |
+| All RAG extras | `pip install "syndicate[all-rag]"` |
+
+## Quick Start
+
+### 1-Minute Example
+
+```python
+import asyncio
+from syndicate.agents import GenericAgent
+from syndicate.clients.openai import OpenAIClient
+
+async def main():
+    # Works with OpenAI, Ollama, etc.
+    client = OpenAIClient(model_name="gpt-4o")
+    agent = GenericAgent(llm_client=client)
+    
+    response = await agent.invoke("Hello, Syndicate!")
+    print(response)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 
 ## Design
 
@@ -73,23 +123,6 @@ These changes reduce race conditions under concurrent load and improve productio
 
 5. **Bucket-Based Memory** - Long conversations are segmented into buckets with automatic summarization on rollover
 
-## Installation
-
-```bash
-# Using uv (recommended)
-uv sync
-
-# Or with pip
-pip install -e .
-```
-
-### Dependencies
-
-- `google-genai>=1.63.0` - Gemini LLM client
-- `mcp>=1.26.0` - Model Context Protocol support
-- `pymongo>=4.16.0` - MongoDB persistent memory
-- `python-dotenv>=1.2.1` - Environment variable management
-
 ## Testing
 
 Run the regression suite to validate concurrency and client hardening behavior:
@@ -110,7 +143,29 @@ This suite includes coverage for:
 - SqlitePostgresMemory custom `table_name` concurrency path
 - MongoMemory duplicate-key race fallback behavior
 
-## Quick Start
+## Troubleshooting
+
+### Missing API Key or Auth Errors
+
+- Ensure `.env` is loaded when using API providers.
+- Verify provider-specific variables such as `GEMINI_API_KEY` or OpenAI-compatible credentials.
+
+### Local OpenAI-Compatible Provider Fails
+
+- Confirm `base_url` includes `/v1` for providers that require OpenAI-compatible paths.
+- For local servers like Ollama/LM Studio, verify host/port and model name are available.
+
+### SQLite/PostgreSQL Memory Connection Errors
+
+- SQLite URL must include async driver: `sqlite+aiosqlite:///./chat_history.db`.
+- PostgreSQL URL must use asyncpg: `postgresql+asyncpg://user:password@host:5432/dbname`.
+
+### MongoDB Memory Errors
+
+- Check `MONGO_URI` connectivity and database permissions.
+- Validate network access from your runtime environment to the MongoDB cluster.
+
+## Usage Patterns
 
 ### Declaring a Client
 
@@ -137,6 +192,20 @@ openai_client = OpenAIClient(
     api_key="ollama"                         # any string for local servers
 )
 ```
+
+## Example Index
+
+Use these runnable examples as guided entry points:
+
+| Example | File | Focus |
+|---------|------|-------|
+| Basic async invocation | `examples/async_usage_example.py` | Minimal agent usage |
+| OpenAI-compatible providers | `examples/openai_usage_example.py` | OpenAI, Ollama, LM Studio-style clients |
+| Runtime facade for services | `examples/runtime_interface_example.py` | `AgentInterface` pattern for web backends |
+| Custom multi-agent setup | `examples/custom_agent_example.py` | Specialization and composition |
+| SQLite persistent memory | `examples/sqlite_memory_example.py` | Bucketed persistence with SQL |
+| RAG knowledge base flow | `examples/rag_knowledge_base_example.py` | Retrieval-augmented workflows |
+| Streaming output check | `examples/streaming_test.py` | Stream chunk behavior |
 
 ## Examples
 

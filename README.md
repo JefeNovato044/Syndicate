@@ -1,5 +1,7 @@
 # Syndicate
 
+> **Pre-release (Beta)**: This framework is in active development. APIs may change before stable 1.0.
+
 > A modular, plug-and-play AI agent framework inspired by neural skill implants. Build intelligent agents by simply plugging in components—no manual configuration required.
 
 ## Philosophy

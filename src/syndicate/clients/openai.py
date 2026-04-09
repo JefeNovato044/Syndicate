@@ -135,9 +135,10 @@ class OpenAIClient(Client):
         tool_calls = None
         if "choices" in raw_response and len(raw_response["choices"]) > 0:
             choice = raw_response["choices"][0]
-            if "message" in choice and "tool_calls" in choice["message"]:
+            raw_tool_calls = choice.get("message", {}).get("tool_calls")
+            if raw_tool_calls:  # guards against None, null, and empty list
                 tool_calls = []
-                for tool_call in choice["message"]["tool_calls"]:
+                for tool_call in raw_tool_calls:
                     raw_args = tool_call.get("function", {}).get("arguments", "{}")
                     if isinstance(raw_args, str):
                         try:
@@ -270,6 +271,12 @@ class OpenAIClient(Client):
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 
+        # Forward any extra provider-specific kwargs (e.g. stop, top_p, seed)
+        _known_kwargs = {"temperature", "max_tokens"}
+        for key, value in kwargs.items():
+            if key not in _known_kwargs:
+                payload[key] = value
+
         # Add tools if provided
         if formatted_tools:
             payload["tools"] = formatted_tools
@@ -338,6 +345,12 @@ class OpenAIClient(Client):
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+
+        # Forward any extra provider-specific kwargs (e.g. stop, top_p, seed)
+        _known_kwargs = {"temperature", "max_tokens"}
+        for key, value in kwargs.items():
+            if key not in _known_kwargs:
+                payload[key] = value
         
         # Add tools if provided
         if formatted_tools:

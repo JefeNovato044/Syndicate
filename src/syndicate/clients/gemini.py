@@ -528,8 +528,10 @@ class GeminiClient(Client):
         
         config = types.GenerateContentConfig(**config_kwargs)
         
-        # Generate response with native async streaming via google.genai.aio
-        async for chunk in self.client.aio.models.generate_content_stream(
+        # Generate response with native async streaming via google.genai.aio.
+        # generate_content_stream() is an async method returning an async iterable
+        # and must be awaited before iteration.
+        async for chunk in await self.client.aio.models.generate_content_stream(
             model=self.model_name,
             contents=chat_messages,
             config=config

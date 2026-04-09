@@ -1031,6 +1031,26 @@ class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
         text_chunks = [c for c in chunks if c.content]
         self.assertTrue(any(c.content == "done" for c in text_chunks))
 
+    async def test_public_stream_surface_forwards_tool_call_events(self):
+        """Regression: stream() shell was dropping ToolCallEvent chunks because
+        it only forwarded chunk.content and chunk.thinking, never chunk.tool_call."""
+        agent = self._make_agent(tool_result="tool_output")
+
+        # Use the public stream() API, not _orchestrate_stream directly
+        chunks = []
+        async for chunk in agent.stream("go", owner_id="test", chat_id="test"):
+            chunks.append(chunk)
+
+        tool_events = [c for c in chunks if c.tool_call is not None]
+        self.assertEqual(len(tool_events), 2, "Public stream() must forward ToolCallEvent chunks")
+
+        statuses = [e.tool_call.status for e in tool_events]
+        self.assertIn("start", statuses)
+        self.assertIn("success", statuses)
+
+        text_chunks = [c for c in chunks if c.content]
+        self.assertTrue(any(c.content == "done" for c in text_chunks))
+
     async def test_stream_emits_error_event_on_tool_failure(self):
         agent = self._make_agent(tool_result=None, tool_error="boom")
 

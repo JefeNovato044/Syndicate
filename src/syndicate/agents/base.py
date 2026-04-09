@@ -261,7 +261,7 @@ class BaseAgent(ABC):
     # ==================== SHELL API (State - Memory & Fallbacks) ====================
     # These methods manage Memory and Fallbacks. MUST NOT be overridden by child classes.
     
-    async def _run_agent(self, messages: List[Message]) -> str:
+    async def _run_agent(self, messages: List[Message], **kwargs) -> str:
         """
         The default core orchestration engine.
         
@@ -270,6 +270,7 @@ class BaseAgent(ABC):
         
         Args:
             messages: Current message history
+            **kwargs: Extra LLM parameters forwarded to the client
             
         Returns:
             Final response string after all tool calls are complete
@@ -277,13 +278,14 @@ class BaseAgent(ABC):
         # Format tools for provider
         
         # Run the blocking orchestration engine
-        return await self._orchestrate_invoke(messages)
+        return await self._orchestrate_invoke(messages, **kwargs)
     
     async def invoke(
         self,
         user_input: str,
         owner_id: str = "default",
-        chat_id: str = "default"
+        chat_id: str = "default",
+        **kwargs
     ) -> str:
         """
         Main interface for interacting with the agent (async).
@@ -294,6 +296,7 @@ class BaseAgent(ABC):
             user_input: The user's message
             owner_id: User identifier for memory (default: "default")
             chat_id: Conversation identifier for memory (default: "default")
+            **kwargs: Extra LLM parameters forwarded to the client (e.g. stop, top_p)
             
         Returns:
             The agent's response as a string
@@ -318,7 +321,7 @@ class BaseAgent(ABC):
 
         try:
             # Run the agent core (this is where child classes can override _run_agent)
-            final_text = await self._run_agent(messages)
+            final_text = await self._run_agent(messages, **kwargs)
 
             # Slice the mutated list to get only new messages (AI responses, tool calls, etc.)
             new_messages = messages[initial_length:]
@@ -337,7 +340,8 @@ class BaseAgent(ABC):
         self,
         user_input: str,
         owner_id: str = "default",
-        chat_id: str = "default"
+        chat_id: str = "default",
+        **kwargs
     ) -> str:
         """
         Synchronous wrapper for invoke() for quick prototyping and testing.
@@ -350,6 +354,7 @@ class BaseAgent(ABC):
             user_input: The user's message
             owner_id: User identifier for memory (default: "default")
             chat_id: Conversation identifier for memory (default: "default")
+            **kwargs: Extra LLM parameters forwarded to the client (e.g. stop, top_p)
             
         Returns:
             The agent's response as a string
@@ -363,12 +368,12 @@ class BaseAgent(ABC):
             asyncio.get_running_loop()
         except RuntimeError:
             # No event loop running — safe to use asyncio.run() directly.
-            return asyncio.run(self.invoke(user_input, owner_id, chat_id))
+            return asyncio.run(self.invoke(user_input, owner_id, chat_id, **kwargs))
 
         # A loop is already running (e.g. Jupyter / IPython kernel).
         # Spin up a worker thread with its own event loop to avoid nesting.
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, self.invoke(user_input, owner_id, chat_id))
+            future = pool.submit(asyncio.run, self.invoke(user_input, owner_id, chat_id, **kwargs))
             return future.result()
     
     async def stream(
@@ -376,7 +381,8 @@ class BaseAgent(ABC):
         user_input: str,
         owner_id: str = "default",
         chat_id: str = "default",
-        include_thinking: bool = False
+        include_thinking: bool = False,
+        **kwargs
     ) -> AsyncGenerator[StreamChunk, None]:
         """
         Stream the agent's response to the UI.
@@ -389,6 +395,7 @@ class BaseAgent(ABC):
             owner_id: User identifier for memory (default: "default")
             chat_id: Conversation identifier for memory (default: "default")
             include_thinking: Whether to include thinking tokens in output
+            **kwargs: Extra LLM parameters forwarded to the client (e.g. stop, top_p)
             
         Yields:
             StreamChunk objects with content chunks progressively
@@ -415,16 +422,18 @@ class BaseAgent(ABC):
         # Run the streaming orchestration engine
         used_fallback_invoke = False
         try:
-            async for chunk in self._orchestrate_stream(messages, include_thinking=include_thinking):
+            async for chunk in self._orchestrate_stream(messages, include_thinking=include_thinking, **kwargs):
                 # Yield content chunks to UI
                 if include_thinking and chunk.thinking:
                     yield chunk
                 if chunk.content:
                     yield chunk
+                if chunk.tool_call is not None:
+                    yield chunk
         except NotImplementedError:
             # Fallback for agents that don't implement streaming
             used_fallback_invoke = True
-            final_response = await self.invoke(user_input, owner_id, chat_id)
+            final_response = await self.invoke(user_input, owner_id, chat_id, **kwargs)
             yield StreamChunk(content=final_response, is_finished=True)
         finally:
             self._request_tool_map_ctx.reset(tool_map_token)
@@ -630,7 +639,8 @@ class BaseAgent(ABC):
         self,
         messages: List[Message],
         formatted_tools: Optional[List] = None,
-        include_thinking = False
+        include_thinking = False,
+        **kwargs
     ) -> AsyncGenerator[StreamChunk, None]:
         """
         Streaming orchestration engine.
@@ -642,6 +652,7 @@ class BaseAgent(ABC):
             messages: Current message history
             formatted_tools: Formatted tools for the LLM provider
             include_thinking
+            **kwargs: Extra LLM parameters forwarded to the client
             
         Yields:
             StreamChunk objects with content chunks progressively
@@ -659,7 +670,8 @@ class BaseAgent(ABC):
             stream = self.llm.chat_completion_stream(
                 messages=messages,
                 system_message=Message(content=self._get_request_system_prompt(), role='system'),
-                tools=active_tools
+                tools=active_tools,
+                **kwargs
             )
             
             # Stream the response
@@ -787,10 +799,20 @@ class BaseAgent(ABC):
             
             # No tool calls - we're done
             break
+        else:
+            # while condition exhausted — max_iterations reached without resolving
+            # all tool calls.  Yield a terminal error chunk so the consumer is never
+            # left hanging waiting for is_finished=True.
+            yield StreamChunk(
+                content=f"Error: Maximum tool call iterations ({max_iterations}) reached.",
+                is_finished=True,
+                finish_reason="max_iterations",
+            )
 
     async def _orchestrate_invoke(
         self,
-        messages: List[Message]
+        messages: List[Message],
+        **kwargs
     ) -> str:
         """
         Blocking orchestration engine.
@@ -800,6 +822,7 @@ class BaseAgent(ABC):
         Args:
             messages: Current message history
             formatted_tools: Formatted tools for the LLM provider
+            **kwargs: Extra LLM parameters forwarded to the client
             
         Returns:
             Final response string after all tool calls are complete
@@ -818,7 +841,8 @@ class BaseAgent(ABC):
             response = await self.llm.chat_completion_async(
                 messages=messages,
                 system_message=Message(content=system_prompt, role='system'),
-                tools=formatted_tools
+                tools=formatted_tools,
+                **kwargs
             )
             
             # Append the response message to history

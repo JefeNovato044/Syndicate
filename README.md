@@ -73,24 +73,6 @@ if __name__ == "__main__":
 
 ## Design
 
-### Production Hardening (March 2026)
-
-Recent reliability fixes focused on concurrency safety and state integrity:
-
-- **Per-request runtime snapshots in `BaseAgent`**
-    - `system_prompt`, formatted tools, and tool instances are now isolated per async request.
-    - Prevents cross-request contamination when tools/prompts are mutated at runtime.
-
-- **Single-active-bucket guarantees in persistent memory**
-    - `SqlitePostgresMemory` and `MongoMemory` now enforce one active bucket per `(owner_id, chat_id)`.
-    - Added race-safe fallback behavior during concurrent bucket creation.
-
-- **OpenAI tool argument parsing hardening**
-    - Non-streaming tool-call argument decoding now handles malformed JSON safely.
-    - Prevents request-level crashes from provider payload edge cases.
-
-These changes reduce race conditions under concurrent load and improve production predictability.
-
 ### Core Architecture
 
 ```
@@ -107,6 +89,20 @@ These changes reduce race conditions under concurrent load and improve productio
 │  └──────────────┘                                            │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Production Hardening
+
+Syndicate is built for production reliability. Key resilience and observability features are documented in detail:
+
+- **[Resilience & Observability](docs/production-hardening/resilience-and-observability.md)**
+  - Tool Execution Policies (Timeout, Retries, Backoff)
+  - Lifecycle Hooks and Observers
+  - Structured Logging
+
+- **Previous Hardening Notes**
+  - Per-request runtime snapshots in `BaseAgent`
+  - Single-active-bucket guarantees in persistent memory
+  - OpenAI tool argument parsing hardening
 
 ### Component Layers
 

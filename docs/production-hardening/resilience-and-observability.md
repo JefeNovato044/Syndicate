@@ -86,3 +86,36 @@ Every `ObserverEvent` contains:
 - `usage`: Token usage data (for model calls).
 - `flow`: The calling method (`invoke` or `stream`).
 - `metadata`: Flexible dictionary for additional context.
+
+---
+
+## Tool Guardrails (FR-003)
+
+Syndicate provides built-in safety mechanisms to prevent runaway tool loops and manage API concurrency. These guardrails are configured at the agent level and apply to all tools.
+
+### Usage
+
+```python
+from syndicate.agents import GenericAgent
+
+agent = GenericAgent(
+    llm_client=client,
+    max_total_tool_calls=10,        # Hard stop after 10 calls per request
+    max_concurrent_tool_calls=2,    # Execute tool calls in batches of 2
+)
+```
+
+### Guardrail Logic
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_total_tool_calls` | `int` | `10` | The absolute maximum number of tool calls allowed per single `invoke()` or `stream()` call. If reached, the interaction stops. |
+| `max_concurrent_tool_calls` | `int` | `5` | The maximum number of tool calls that can run in parallel. Syndicate uses **batching** to process calls in chunks of this size. |
+
+### Terminal Signals
+
+When `max_total_tool_calls` is reached:
+- **`invoke()`**: Returns the final content received from the model up to that point.
+- **`stream()`**: Emits a final chunk with `finish_reason="guardrail_reached"` to signal the abrupt stop.
+
+This prevents the agent from entering infinite "tool-response-tool" loops that consume tokens and API credits.

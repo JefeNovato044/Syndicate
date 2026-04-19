@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from collections.abc import AsyncGenerator
 
 from ..communication_models import Message, ToolCall, StreamChunk, ToolCallEvent
+from ..tools.base_tool import ToolExecutionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -565,6 +566,38 @@ class BaseAgent(ABC):
         """Get request-local tool-instance map, if any."""
         return self._request_tool_map_ctx.get()
 
+    def _resolve_tool_execution_policy(self, tool_instance: Any) -> Optional[ToolExecutionPolicy]:
+        """Return normalized execution policy for a tool instance (if configured)."""
+        policy_getter = getattr(tool_instance, "get_execution_policy", None)
+        if callable(policy_getter):
+            try:
+                return policy_getter()
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Invalid execution policy on tool '%s': %s",
+                    self.name,
+                    getattr(tool_instance, "name", "unknown"),
+                    exc,
+                    exc_info=True,
+                )
+                return None
+
+        raw_policy = getattr(tool_instance, "execution_policy", None)
+        if raw_policy is None:
+            return None
+
+        try:
+            return ToolExecutionPolicy.coerce(raw_policy)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Invalid execution policy on tool '%s': %s",
+                self.name,
+                getattr(tool_instance, "name", "unknown"),
+                exc,
+                exc_info=True,
+            )
+            return None
+
     async def execute_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
         """
         Execute a tool by name with given arguments.
@@ -596,13 +629,57 @@ class BaseAgent(ABC):
                 "success": False,
                 "error": f"Tool '{tool_name}' not found"
             }
+
+        policy = self._resolve_tool_execution_policy(tool_instance)
+
+        # Backward compatibility path: tools without policy keep prior behavior.
+        if policy is None:
+            try:
+                result = await tool_instance.run_async(**kwargs)
+                return {"success": True, "result": result}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
         
-        # Execute using async wrapper (handles both sync and async tools)
-        try:
-            result = await tool_instance.run_async(**kwargs)
-            return {"success": True, "result": result}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        max_attempts = policy.max_attempts
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if policy.timeout_seconds is not None:
+                    result = await asyncio.wait_for(
+                        tool_instance.run_async(**kwargs),
+                        timeout=policy.timeout_seconds,
+                    )
+                else:
+                    result = await tool_instance.run_async(**kwargs)
+                return {"success": True, "result": result}
+            except asyncio.CancelledError:
+                # Cancellation should propagate and must never be retried.
+                raise
+            except Exception as exc:
+                if isinstance(exc, asyncio.TimeoutError) and policy.timeout_ms is not None:
+                    error_message = f"Tool '{tool_name}' timed out after {policy.timeout_ms} ms"
+                else:
+                    error_message = str(exc)
+
+                should_retry = (
+                    attempt < max_attempts
+                    and policy.is_retryable_error(exc)
+                )
+
+                if not should_retry:
+                    return {"success": False, "error": error_message}
+
+                delay_seconds = policy.backoff.get_delay_seconds(retry_number=attempt)
+                if self.verbose:
+                    logger.warning(
+                        "[%s] Retrying tool '%s' (%s/%s) after error: %s",
+                        self.name,
+                        tool_name,
+                        attempt,
+                        max_attempts - 1,
+                        error_message,
+                    )
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
         
     async def _execute_tools_concurrently(self, tool_calls: List[ToolCall]) -> List[Message]:
         """

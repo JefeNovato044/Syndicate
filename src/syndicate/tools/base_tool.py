@@ -1,6 +1,9 @@
 import asyncio
-from typing import Dict, Any, Optional, List
+import inspect
+from typing import Dict, Any, Optional, List, Literal
 from abc import ABC, abstractmethod
+
+from pydantic import BaseModel, Field, field_validator
 
 try:
     from langchain.tools import StructuredTool
@@ -128,20 +131,137 @@ def _resolve_local_refs_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
     return _resolve(schema)
 
 
+class ToolBackoffPolicy(BaseModel):
+    """Retry backoff configuration for tool execution."""
+
+    strategy: Literal["fixed", "exponential"] = Field(
+        default="exponential",
+        description="Backoff strategy to use between retry attempts.",
+    )
+    initial_delay_ms: int = Field(
+        default=200,
+        ge=0,
+        description="Delay before the first retry attempt.",
+    )
+    max_delay_ms: int = Field(
+        default=2000,
+        ge=0,
+        description="Upper bound for computed retry delay.",
+    )
+    multiplier: float = Field(
+        default=2.0,
+        ge=1.0,
+        description="Multiplier used by exponential backoff.",
+    )
+
+    def get_delay_seconds(self, retry_number: int) -> float:
+        """Compute retry delay in seconds for a 1-based retry number."""
+        if retry_number <= 0 or self.initial_delay_ms <= 0:
+            return 0.0
+
+        if self.strategy == "fixed":
+            delay_ms = self.initial_delay_ms
+        else:
+            delay_ms = self.initial_delay_ms * (self.multiplier ** (retry_number - 1))
+
+        if self.max_delay_ms > 0:
+            delay_ms = min(delay_ms, self.max_delay_ms)
+
+        return max(0.0, delay_ms / 1000.0)
+
+
+class ToolExecutionPolicy(BaseModel):
+    """Per-tool execution reliability controls (timeout + retries + backoff)."""
+
+    timeout_ms: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Per-attempt timeout in milliseconds. None means no timeout.",
+    )
+    max_retries: int = Field(
+        default=0,
+        ge=0,
+        description="How many retries to attempt after the initial failure.",
+    )
+    backoff: ToolBackoffPolicy = Field(
+        default_factory=ToolBackoffPolicy,
+        description="Backoff configuration between retries.",
+    )
+    retryable_errors: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Exception names eligible for retry (e.g. ['TimeoutError', 'ValueError']). "
+            "When omitted, only timeouts are retried."
+        ),
+    )
+
+    @field_validator("retryable_errors")
+    @classmethod
+    def _normalize_retryable_errors(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        return [entry.strip() for entry in value if isinstance(entry, str) and entry.strip()]
+
+    @property
+    def max_attempts(self) -> int:
+        """Total attempts including the initial one."""
+        return self.max_retries + 1
+
+    @property
+    def timeout_seconds(self) -> Optional[float]:
+        if self.timeout_ms is None:
+            return None
+        return self.timeout_ms / 1000.0
+
+    def is_retryable_error(self, error: Exception) -> bool:
+        """Whether an exception is eligible for retry under this policy."""
+        configured = self.retryable_errors
+
+        if isinstance(error, asyncio.TimeoutError):
+            if configured is None:
+                return True
+
+        if not configured:
+            return False
+
+        exception_names = set()
+        for exc_type in type(error).mro():
+            if exc_type is object:
+                continue
+            exception_names.add(exc_type.__name__)
+            exception_names.add(f"{exc_type.__module__}.{exc_type.__name__}")
+
+        return any(error_name in exception_names for error_name in configured)
+
+    @classmethod
+    def coerce(cls, policy: Any) -> Optional["ToolExecutionPolicy"]:
+        """Accept a model or dict policy declaration and normalize to model."""
+        if policy is None:
+            return None
+        if isinstance(policy, cls):
+            return policy
+        if isinstance(policy, dict):
+            return cls.model_validate(policy)
+        raise TypeError(
+            "Tool execution policy must be ToolExecutionPolicy, dict, or None"
+        )
+
+
 class BaseTool(ABC):
     """
     Base class for all tools.
     Provides abstraction layer to convert tools to different provider formats.
-    
+
     Supports both sync and async implementations:
     - Sync: def run(self, **kwargs) -> Any
     - Async: async def run(self, **kwargs) -> Any
-    
+
     The framework automatically handles both cases via run_async().
     """
     name: str
     description: str
     args_schema: Optional[type] = None
+    execution_policy: Optional[ToolExecutionPolicy | Dict[str, Any]] = None
 
     @abstractmethod
     def run(self, **kwargs) -> Any:
@@ -182,12 +302,16 @@ class BaseTool(ABC):
                     return f"Searching: {query}"
         """
         # Check if run is an async function
-        if asyncio.iscoroutinefunction(self.run):
+        if inspect.iscoroutinefunction(self.run):
             # User implemented async - await it directly
             return await self.run(**kwargs)
         else:
             # User implemented sync - run in thread pool to avoid blocking
             return await asyncio.to_thread(self.run, **kwargs)
+
+    def get_execution_policy(self) -> Optional[ToolExecutionPolicy]:
+        """Return this tool's normalized execution policy, if configured."""
+        return ToolExecutionPolicy.coerce(getattr(self, "execution_policy", None))
 
     def execute(self, **kwargs) -> Dict[str, Any]:
         """

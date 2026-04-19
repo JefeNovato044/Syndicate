@@ -22,7 +22,12 @@ from syndicate.memory.mongo import MongoMemory
 from syndicate.memory.sqlite_postgres import SqlitePostgresMemory
 from syndicate.mcp import MCPSubTool
 from syndicate.tools.agent_tool import AgentAsTool
-from syndicate.tools.base_tool import _clean_schema_for_gemini
+from syndicate.tools.base_tool import (
+    BaseTool,
+    ToolBackoffPolicy,
+    ToolExecutionPolicy,
+    _clean_schema_for_gemini,
+)
 
 
 class _FakeDelegatedAgent:
@@ -1119,6 +1124,146 @@ class SummarizerAgentCompatibilityTests(IsolatedAsyncioTestCase):
                 )
 
         self.assertIn("Expected a string response", str(ctx.exception))
+
+
+class ToolExecutionPolicyResilienceTests(unittest.IsolatedAsyncioTestCase):
+    class _NoopLLM:
+        provider_type = "openai"
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            return ChatResponse(content="ok", role="ai")
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            yield StreamChunk(content="ok", is_finished=True)
+
+    def _build_agent(self, tools):
+        return BaseAgent(
+            llm_client=self._NoopLLM(),
+            memory=LocalMemory(rollover_enabled=False),
+            system_prompt="sys",
+            tools=tools,
+        )
+
+    async def test_timeout_retried_until_max_retries(self):
+        class _TimeoutTool(BaseTool):
+            name = "timeout_tool"
+            description = "Always times out"
+            execution_policy = ToolExecutionPolicy(
+                timeout_ms=5,
+                max_retries=2,
+                backoff=ToolBackoffPolicy(
+                    strategy="fixed",
+                    initial_delay_ms=0,
+                    max_delay_ms=0,
+                ),
+            )
+
+            def __init__(self):
+                self.calls = 0
+
+            async def run(self, **kwargs):
+                self.calls += 1
+                await asyncio.sleep(0.02)
+                return "late"
+
+        tool = _TimeoutTool()
+        agent = self._build_agent([tool])
+
+        result = await agent.execute_tool("timeout_tool")
+
+        self.assertFalse(result.get("success"))
+        self.assertEqual(tool.calls, 3)
+        self.assertIn("timed out", result.get("error", ""))
+
+    async def test_non_retryable_exception_fails_fast(self):
+        class _FailFastTool(BaseTool):
+            name = "fail_fast_tool"
+            description = "Raises non-retryable exception"
+            execution_policy = ToolExecutionPolicy(
+                max_retries=3,
+                retryable_errors=["TimeoutError"],
+                backoff=ToolBackoffPolicy(
+                    strategy="fixed",
+                    initial_delay_ms=0,
+                    max_delay_ms=0,
+                ),
+            )
+
+            def __init__(self):
+                self.calls = 0
+
+            async def run(self, **kwargs):
+                self.calls += 1
+                raise ValueError("boom")
+
+        tool = _FailFastTool()
+        agent = self._build_agent([tool])
+
+        result = await agent.execute_tool("fail_fast_tool")
+
+        self.assertFalse(result.get("success"))
+        self.assertEqual(tool.calls, 1)
+        self.assertIn("boom", result.get("error", ""))
+
+    async def test_policy_retries_support_async_and_sync_tools(self):
+        class _FlakyAsyncTool(BaseTool):
+            name = "flaky_async_tool"
+            description = "Fails once then succeeds (async)"
+            execution_policy = ToolExecutionPolicy(
+                max_retries=1,
+                retryable_errors=["ValueError"],
+                backoff=ToolBackoffPolicy(
+                    strategy="fixed",
+                    initial_delay_ms=0,
+                    max_delay_ms=0,
+                ),
+            )
+
+            def __init__(self):
+                self.calls = 0
+
+            async def run(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ValueError("transient")
+                return "async-ok"
+
+        class _FlakySyncTool(BaseTool):
+            name = "flaky_sync_tool"
+            description = "Fails once then succeeds (sync)"
+            execution_policy = ToolExecutionPolicy(
+                max_retries=1,
+                retryable_errors=["ValueError"],
+                backoff=ToolBackoffPolicy(
+                    strategy="fixed",
+                    initial_delay_ms=0,
+                    max_delay_ms=0,
+                ),
+            )
+
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ValueError("transient")
+                return "sync-ok"
+
+        async_tool = _FlakyAsyncTool()
+        sync_tool = _FlakySyncTool()
+        agent = self._build_agent([async_tool, sync_tool])
+
+        async_result = await agent.execute_tool("flaky_async_tool")
+        sync_result = await agent.execute_tool("flaky_sync_tool")
+
+        self.assertTrue(async_result.get("success"))
+        self.assertEqual(async_result.get("result"), "async-ok")
+        self.assertEqual(async_tool.calls, 2)
+
+        self.assertTrue(sync_result.get("success"))
+        self.assertEqual(sync_result.get("result"), "sync-ok")
+        self.assertEqual(sync_tool.calls, 2)
 
 
 if __name__ == "__main__":

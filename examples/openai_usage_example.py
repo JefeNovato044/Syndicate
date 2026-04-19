@@ -18,12 +18,14 @@ Example models:
 """
 
 import asyncio
-from clients import OpenAIClient
-from agents import GenericAgent
-from tools.weather_tool import WeatherTool
+import os
+
+from syndicate.clients import OpenAIClient
+from syndicate.agents import GenericAgent
+from syndicate.tools.weather_tool import CurrentWeatherTool
 
 
-def example_ollama():
+async def example_ollama():
     """Example using Ollama (local model)."""
     print("=" * 60)
     print("Example 1: Ollama (Local Model)")
@@ -44,8 +46,8 @@ def example_ollama():
         name="OllamaAgent"
     )
     
-    # Use sync invoke
-    response = agent.invoke("What is the capital of France?")
+    # Use async invoke
+    response = await agent.invoke("What is the capital of France?")
     print(f"Response: {response}\n")
 
 
@@ -82,9 +84,10 @@ async def example_openai_cloud():
     print("=" * 60)
     
     # Initialize client for OpenAI
+    api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
     client = OpenAIClient(
         base_url="https://api.openai.com/v1",
-        api_key="YOUR_OPENAI_API_KEY_HERE",  # Replace with your actual key
+        api_key=api_key,
         model_name="gpt-4",
         temperature=0.7
     )
@@ -116,10 +119,11 @@ async def example_with_tools():
     )
     
     # Create agent with weather tool
+    weather_api_key = os.getenv("TOMORROW_API_KEY", "YOUR_TOMORROW_API_KEY_HERE")
     agent = GenericAgent(
         llm_client=client,
         system_prompt="You are a weather assistant with access to weather tools.",
-        tools=[WeatherTool()]
+        tools=[CurrentWeatherTool(api_key=weather_api_key)]
     )
     
     # Use async invoke - agent will call the tool
@@ -138,14 +142,12 @@ async def example_concurrent_local_models():
         OpenAIClient(
             base_url="http://localhost:11434/v1",
             api_key="ollama",
-            model_name="llama3",
-            name="llama3"
+            model_name="llama3"
         ),
         OpenAIClient(
             base_url="http://localhost:11434/v1",
             api_key="ollama",
-            model_name="mistral",
-            name="mistral"
+            model_name="mistral"
         )
     ]
     
@@ -154,7 +156,7 @@ async def example_concurrent_local_models():
         GenericAgent(
             llm_client=client,
             system_prompt="You are a helpful assistant.",
-            name=client.name
+            name=f"{client.model_name}-agent"
         )
         for client in clients
     ]
@@ -191,7 +193,7 @@ async def main():
     
     try:
         # Example 1: Ollama (local)
-        example_ollama()
+        await example_ollama()
         
         # Example 2: LM Studio (local)
         await example_lm_studio()

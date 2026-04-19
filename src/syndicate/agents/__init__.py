@@ -4,7 +4,7 @@ Agents module - Base agent and generic agent implementations.
 Async-First Architecture:
     - BaseAgent.invoke() is now async
     - GenericAgent.invoke() is now async
-    - Use SyncGenericAgent for backward compatibility with sync code
+    - Use invoke_sync() when you need blocking usage in sync contexts
     - Use GenericAgent for async workflows with asyncio
 
 Example:
@@ -13,8 +13,8 @@ Example:
     response = await agent.invoke("Hello")
     
     # Sync usage (for simple scripts)
-    agent = SyncGenericAgent(client)
-    response = agent.invoke("Hello")
+    agent = GenericAgent(client)
+    response = agent.invoke_sync("Hello")
 """
 
 from .base import BaseAgent

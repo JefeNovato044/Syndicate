@@ -260,7 +260,7 @@ async def create_agent_with_knowledge_base(vector_store: MongoVectorStore):
     """
     # Create LLM client
     api_key = os.getenv("GEMINI_API_KEY", "your-api-key-here")
-    llm_client = GeminiClient(api_key=api_key, model="gemini-1.5-pro")
+    llm_client = GeminiClient(api_key=api_key, model_name="gemini-1.5-pro")
     
     # Create agent
     agent = GenericAgent(
@@ -327,14 +327,9 @@ async def demonstrate_search(vector_store: MongoVectorStore):
     for query in queries:
         print(f"\nQuery: {query}")
         print("-" * 40)
-        
-        result = await search_tool.execute(query=query)
-        
-        if result["success"]:
-            print(f"Found {result['count']} results:")
-            print(result["formatted"])
-        else:
-            print(f"Error: {result.get('error', 'Unknown error')}")
+
+        formatted = await search_tool.run_async(query=query, top_k=3)
+        print(formatted)
         
         print()
 
@@ -418,14 +413,8 @@ if __name__ == "__main__":
 """
 OLD APPROACH (Deprecated):
 --------------------------
-from syndicate.memory.rag import BaseRAGMemory
-
-class MyRAGMemory(BaseRAGMemory):
-    async def add_document(...): ...
-    async def search(...): ...
-
-rag_memory = MyRAGMemory()
-agent.memory = rag_memory  # Framework-controlled
+Older versions used a framework-managed RAG memory abstraction where
+retrieval happened behind the scenes.
 
 
 NEW APPROACH (Recommended):

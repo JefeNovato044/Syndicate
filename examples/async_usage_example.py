@@ -2,7 +2,8 @@
 Async Agent Usage Example
 
 Demonstrates the async-first architecture of Syndicate.
-Shows how to use both sync and async agents, concurrent tool execution,
+Shows how to use async agents, invoke_sync convenience wrappers,
+concurrent tool execution,
 and the asyncio.gather() pattern for parallel operations.
 
 Run with: python examples/async_usage_example.py
@@ -10,9 +11,21 @@ Run with: python examples/async_usage_example.py
 
 import asyncio
 import time
-from agents import GenericAgent, SyncGenericAgent
-from clients import GeminiClient
-from tools.weather_tool import WeatherTool
+
+from syndicate.agents import GenericAgent
+from syndicate.clients import GeminiClient
+from syndicate.tools.base_tool import BaseTool
+
+
+class AsyncWeatherTool(BaseTool):
+    """Async demo tool used for concurrency examples (no external API dependency)."""
+
+    name = "async_weather"
+    description = "Get weather asynchronously (simulated)."
+
+    async def run(self, city: str) -> str:
+        await asyncio.sleep(1)
+        return f"Async weather for {city}: 72F, sunny"
 
 
 async def example_async_agent():
@@ -31,7 +44,7 @@ async def example_async_agent():
     agent = GenericAgent(
         llm_client=client,
         system_prompt="You are a helpful assistant with weather knowledge.",
-        tools=[WeatherTool()]
+        tools=[AsyncWeatherTool()]
     )
     
     # Use async invoke
@@ -53,7 +66,7 @@ async def example_concurrent_tools():
     agent = GenericAgent(
         llm_client=client,
         system_prompt="You are a research assistant.",
-        tools=[WeatherTool()]
+        tools=[AsyncWeatherTool()]
     )
     
     # Simulate multiple concurrent tool calls
@@ -62,9 +75,9 @@ async def example_concurrent_tools():
     
     # Create multiple async tasks
     tasks = [
-        agent.execute_tool("get_weather", city="Tokyo"),
-        agent.execute_tool("get_weather", city="New York"),
-        agent.execute_tool("get_weather", city="London"),
+        agent.execute_tool("async_weather", city="Tokyo"),
+        agent.execute_tool("async_weather", city="New York"),
+        agent.execute_tool("async_weather", city="London"),
     ]
     
     # Execute all concurrently
@@ -120,28 +133,27 @@ async def example_multi_agent_parallel():
     print()
 
 
-def example_sync_agent():
-    """Example using sync SyncGenericAgent for backward compatibility."""
-    # print("=" * 60)
-    # print("Example 4: Sync GenericAgent (Backward Compatible)")
-    # print("=" * 60)
-    # 
-    # client = GeminiClient(
-    #     model_name="gemini-2.0-flash-exp",
-    #     api_key="YOUR_API_KEY_HERE"
-    # )
-    # 
-    # # Create sync agent
-    # agent = SyncGenericAgent(
-    #     llm_client=client,
-    #     system_prompt="You are a helpful assistant.",
-    #     name="SyncAgent"
-    # )
-    # 
-    # # Use sync invoke (no await needed)
-    # response = agent.invoke("Hello, how are you?")
-    # print(f"Response: {response}\n")
-    pass
+def example_invoke_sync_from_async_context():
+    """Example showing invoke_sync convenience from an async runtime."""
+    print("=" * 60)
+    print("Example 4: invoke_sync Convenience")
+    print("=" * 60)
+
+    client = GeminiClient(
+        model_name="gemini-2.0-flash-exp",
+        api_key="YOUR_API_KEY_HERE"
+    )
+
+    agent = GenericAgent(
+        llm_client=client,
+        system_prompt="You are a helpful assistant.",
+        name="SyncWrapperAgent"
+    )
+
+    # invoke_sync works even when an event loop is already running
+    # (the framework offloads to a worker thread internally).
+    response = agent.invoke_sync("Say hello in one short sentence.")
+    print(f"Response: {response}\n")
 
 async def example_async_tool():
     """Example of creating an async tool."""
@@ -153,16 +165,6 @@ async def example_async_tool():
         model_name="gemini-2.0-flash-exp",
         api_key="YOUR_API_KEY_HERE"
     )
-    
-    # Create an async tool
-    class AsyncWeatherTool:
-        name = "async_weather"
-        description = "Get weather asynchronously (simulated)"
-        
-        async def run(self, city: str) -> str:
-            # Simulate async operation
-            await asyncio.sleep(1)
-            return f"Async weather for {city}: 72°F, sunny"
     
     agent = GenericAgent(
         llm_client=client,
@@ -185,7 +187,7 @@ async def main():
         await example_async_agent()
         await example_concurrent_tools()
         await example_multi_agent_parallel()
-        example_sync_agent()
+        example_invoke_sync_from_async_context()
         await example_async_tool()
         
         print("=" * 60)

@@ -44,7 +44,7 @@ async def resolve_summarizer(
     Execute any summarizer type and return the summary string.
     
     Normalizes different summarizer types to a common execution path:
-    - BaseAgent: Calls agent.run() with formatted conversation prompt
+    - BaseAgent: Calls agent.invoke() with formatted conversation prompt
     - Callable: Direct invocation with messages list
     
     Args:
@@ -62,17 +62,22 @@ async def resolve_summarizer(
     from ..agents.base import BaseAgent
     
     if isinstance(summarizer, BaseAgent):
-        # Agent path - format messages as prompt and run
+        # Agent path - format messages as prompt and invoke the agent.
+        # Use dedicated owner/chat IDs to avoid polluting user conversations.
         formatted = format_messages_for_summary(messages)
-        response = await summarizer.run(formatted)
+        response = await summarizer.invoke(
+            formatted,
+            owner_id="memory-summarizer",
+            chat_id="memory-summarizer",
+        )
         
         # Validate agent response
-        if not hasattr(response, 'content') or not isinstance(response.content, str):
+        if not isinstance(response, str):
             raise ValueError(
                 f"Summarization agent returned invalid response type: {type(response)}. "
-                "Expected ChatResponse with 'content' string attribute."
+                "Expected a string response from agent.invoke()."
             )
-        return response.content
+        return response
     
     elif callable(summarizer):
         # Callable path - direct invocation

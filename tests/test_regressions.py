@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import IsolatedAsyncioTestCase
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 from uuid import uuid4
@@ -15,6 +16,7 @@ from syndicate.communication_models import Message, ToolCall, ChatResponse, Stre
 from syndicate.clients.gemini import GeminiClient
 from syndicate.clients.openai import OpenAIClient
 from syndicate.memory.local import LocalMemory
+from syndicate.memory.summarizers import resolve_summarizer
 from pymongo.errors import DuplicateKeyError
 from syndicate.memory.mongo import MongoMemory
 from syndicate.memory.sqlite_postgres import SqlitePostgresMemory
@@ -1078,6 +1080,45 @@ class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
             content += chunk.content  # tool_call chunks have content="" by default
 
         self.assertEqual(content, "done")
+
+
+class SummarizerAgentCompatibilityTests(IsolatedAsyncioTestCase):
+    class _DummyLLM:
+        provider_type = "openai"
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            return ChatResponse(content="unused", role="ai")
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            yield StreamChunk(content="unused", is_finished=True)
+
+    async def test_resolve_summarizer_uses_agent_invoke_contract(self):
+        agent = BaseAgent(llm_client=self._DummyLLM(), memory=LocalMemory())
+
+        with patch.object(agent, "invoke", new_callable=AsyncMock) as mocked_invoke:
+            mocked_invoke.return_value = "summary-ok"
+
+            result = await resolve_summarizer(
+                agent,
+                [Message(role="human", content="hola")],
+            )
+
+        self.assertEqual(result, "summary-ok")
+        mocked_invoke.assert_awaited_once()
+
+    async def test_resolve_summarizer_rejects_non_string_agent_response(self):
+        agent = BaseAgent(llm_client=self._DummyLLM(), memory=LocalMemory())
+
+        with patch.object(agent, "invoke", new_callable=AsyncMock) as mocked_invoke:
+            mocked_invoke.return_value = ChatResponse(content="not-string-contract", role="ai")
+
+            with self.assertRaises(ValueError) as ctx:
+                await resolve_summarizer(
+                    agent,
+                    [Message(role="human", content="hola")],
+                )
+
+        self.assertIn("Expected a string response", str(ctx.exception))
 
 
 if __name__ == "__main__":

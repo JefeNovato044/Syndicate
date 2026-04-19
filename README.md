@@ -51,12 +51,17 @@ pip install -e .
 
 ```python
 import asyncio
+import os
 from syndicate.agents import GenericAgent
 from syndicate.clients.openai import OpenAIClient
 
 async def main():
-    # Works with OpenAI, Ollama, etc.
-    client = OpenAIClient(model_name="gpt-4o")
+    # OpenAI cloud example (for local providers, change base_url/model accordingly)
+    client = OpenAIClient(
+        base_url="https://api.openai.com/v1",
+        api_key=os.getenv("OPENAI_API_KEY", ""),
+        model_name="gpt-4o"
+    )
     agent = GenericAgent(llm_client=client)
     
     response = await agent.invoke("Hello, Syndicate!")
@@ -477,7 +482,7 @@ agent = GenericAgent(
 await agent.invoke("My name is Alice", owner_id="alice", chat_id="session1")
 await agent.invoke("My name is Bob",   owner_id="bob",   chat_id="session1")
 
-history = agent.get_history(owner_id="alice", chat_id="session1")
+history = await agent.get_history(owner_id="alice", chat_id="session1")
 ```
 
 ## API Reference
@@ -507,7 +512,7 @@ Core agent class. Implements a Template Method Pattern with a Hybrid API.
 | `invoke_sync(input, owner_id, chat_id)` | Blocking version for sync contexts |
 | `stream(input, include_thinking)` | Async generator yielding `StreamChunk` |
 | `install_skill(skill)` | Add a `SkillModule` at runtime (chainable) |
-| `get_history(owner_id, chat_id)` | Retrieve raw conversation history |
+| `await get_history(owner_id, chat_id)` | Retrieve raw conversation history |
 
 ### Operational Interface (Web/Service Runtime)
 
@@ -612,15 +617,17 @@ client = OpenAIClient(base_url="https://api.openai.com/v1", api_key="sk-...", mo
 
 ### Memory
 
-Two abstraction layers:
+Conversation memory abstraction:
 
-1. **`BaseChatMemory`** - Sequential conversation history with bucket-based rollover
-2. **`BaseRAGMemory`** - Semantic/vector-based retrieval for long-term knowledge
+1. **`BaseChatMemory`** - Sequential conversation history with bucket-based rollover and optional summarization
 
 | Implementation | Storage | Persistence | Notes |
 |---------------|---------|-------------|-------|
 | `LocalMemory` | In-process dict | ❌ | Default; great for tests and notebooks |
 | `MongoMemory` | MongoDB | ✅ | Multi-tenant, with rollover & summarization |
+| `SqlitePostgresMemory` | SQLite/PostgreSQL | ✅ | Persistent relational backend with rollover & summarization |
+
+For semantic retrieval (RAG), use the vector store layer (`BaseVectorStore`, `MongoVectorStore`) with tools/skills such as `RAGSearchTool` and `KnowledgeBaseSkill`.
 
 ### Skills (SkillModule)
 
@@ -695,7 +702,7 @@ src/syndicate/
 │   ├── gemini.py        # GeminiClient (API key + Vertex AI)
 │   └── openai.py        # OpenAIClient (OpenAI, Ollama, LM Studio, vLLM)
 ├── memory/
-│   ├── base.py          # BaseChatMemory, BaseRAGMemory ABCs
+│   ├── base.py          # BaseChatMemory ABC + rollover/summarization logic
 │   ├── local.py         # LocalMemory (in-process)
 │   ├── mongo.py         # MongoMemory (persistent, multi-tenant)
 │   ├── sqlite_postgres.py # SqlitePostgresMemory (SQLite/PostgreSQL)

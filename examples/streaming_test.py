@@ -9,16 +9,12 @@ Usage:
 """
 
 import asyncio
-import sys
-from typing import Dict, Any
+import os
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(__file__).parent.parent)
-
-from communication_models import StreamChunk
-from clients import OpenAIClient
-from agents import GenericAgent
-from tools.weather_tool import WeatherTool
+from syndicate.communication_models import Message, StreamChunk
+from syndicate.clients import OpenAIClient
+from syndicate.agents import GenericAgent
+from syndicate.tools.weather_tool import CurrentWeatherTool
 
 
 async def test_client_streaming():
@@ -41,14 +37,13 @@ async def test_client_streaming():
         
         # Create test messages
         messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Count to 10 slowly."}
+            Message(role="human", content="Count to 10 slowly.")
         ]
         
         # Stream the response
         async for chunk in client.chat_completion_stream(
             messages=messages,
-            system_message={"role": "system", "content": "You are a helpful assistant."}
+            system_message=Message(role="system", content="You are a helpful assistant.")
         ):
             if chunk.content:
                 print(chunk.content, end="", flush=True)
@@ -56,7 +51,7 @@ async def test_client_streaming():
         print("\n" + "-" * 40)
         print("✓ Client streaming completed successfully")
         
-        client.close()
+        await client.aclose()
         
     except Exception as e:
         print(f"✗ Client streaming test skipped (LLM not available): {e}")
@@ -92,7 +87,7 @@ async def test_agent_streaming_no_tools():
         print("\n" + "-" * 40)
         print("✓ Agent streaming (no tools) completed successfully")
         
-        client.close()
+        await client.aclose()
         
     except Exception as e:
         print(f"✗ Agent streaming test skipped: {e}")
@@ -105,6 +100,7 @@ async def test_agent_streaming_with_tools():
     print("="*60)
     
     try:
+        weather_api_key = os.getenv("TOMORROW_API_KEY", "YOUR_TOMORROW_API_KEY_HERE")
         client = OpenAIClient(
             base_url="http://localhost:11434/v1",
             api_key="ollama",
@@ -114,7 +110,7 @@ async def test_agent_streaming_with_tools():
         agent = GenericAgent(
             llm_client=client,
             system_prompt="You are a weather assistant. Use the weather tool when asked about weather.",
-            tools=[WeatherTool()]
+            tools=[CurrentWeatherTool(api_key=weather_api_key)]
         )
         
         print("\nStreaming response from agent (with weather tool)...")
@@ -128,7 +124,7 @@ async def test_agent_streaming_with_tools():
         print("\n" + "-" * 40)
         print("✓ Agent streaming (with tools) completed successfully")
         
-        client.close()
+        await client.aclose()
         
     except Exception as e:
         print(f"✗ Agent streaming test skipped: {e}")
@@ -161,10 +157,8 @@ async def test_message_role_tool():
     print("TEST 5: Message Role 'tool'")
     print("="*60)
     
-    from communication_models import Message
-    
     # Create messages with tool role
-    tool_msg = Message(role="tool", content="Tool result: 25 degrees")
+    tool_msg = Message(role="tool", content="Tool result: 25 degrees", tool_call_id="call_1")
     user_msg = Message(role="human", content="What's the weather?")
     ai_msg = Message(role="ai", content="The weather is 25 degrees.")
     
@@ -173,8 +167,8 @@ async def test_message_role_tool():
     print(f"AI message: {ai_msg.role} - {ai_msg.content}")
     
     # Test role normalization
-    normalized = Message(role="function", content="test")
-    print(f"\nNormalized 'function' role: {normalized.role}")
+    normalized = Message(role="assistant", content="test")
+    print(f"\nNormalized 'assistant' role: {normalized.role}")
     
     print("\n✓ Message role 'tool' test passed")
 

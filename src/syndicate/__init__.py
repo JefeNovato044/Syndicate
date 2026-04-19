@@ -13,7 +13,8 @@ from .communication_models import (
     StreamChunk,
     ToolCallEvent,
 )
-from .protocols import AgentInterface
+from .protocols import AgentInterface, Observer
+from .observability import LoggingObserver, InMemoryObserver
 
 # Import registry for agent discovery
 from .registry import AgentRegistry
@@ -40,6 +41,7 @@ __all__ = [
     'StreamChunk',
     'ToolCallEvent',
     'AgentInterface',
+    'Observer',
     # Registries
     'AgentRegistry',
     'MCPSessionManager',
@@ -51,6 +53,9 @@ __all__ = [
     'Client',
     'GeminiClient',
     'OpenAIClient',
+    # Observability
+    'LoggingObserver',
+    'InMemoryObserver',
     # Memory
     'BaseChatMemory',
     'LocalMemory',

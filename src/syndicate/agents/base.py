@@ -3,11 +3,15 @@
 import logging
 from abc import ABC
 import asyncio
+import inspect
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from collections.abc import AsyncGenerator
+from uuid import uuid4
 
 from ..communication_models import Message, ToolCall, StreamChunk, ToolCallEvent
+from ..protocols import Observer
 from ..tools.base_tool import ToolExecutionPolicy
 
 logger = logging.getLogger(__name__)
@@ -93,6 +97,7 @@ class BaseAgent(ABC):
         name: Optional[str] = None,
         tools: Optional[List] = None,
         skills: Optional[List["SkillModule"]] = None,
+        observers: Optional[List[Observer]] = None,
         vision_client = None,
         audio_client = None,
         verbose: bool = False,
@@ -110,6 +115,7 @@ class BaseAgent(ABC):
         self.max_iterations = kwargs.get("max_iterations", self.__class__.max_iterations)
         
         self.skills: List["SkillModule"] = skills or []  # Skill modules
+        self.observers: List[Observer] = list(observers or [])
         
         # Auto-detect provider from client (motherboard auto-detection)
         self.provider = self._detect_provider(llm_client)
@@ -138,6 +144,10 @@ class BaseAgent(ABC):
         )
         self._request_tool_map_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
             f"base_agent_tool_map_{id(self)}",
+            default=None,
+        )
+        self._request_observer_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+            f"base_agent_observer_{id(self)}",
             default=None,
         )
 
@@ -305,22 +315,39 @@ class BaseAgent(ABC):
         Example:
             response = await agent.invoke("What's the weather?")
         """
-        # Build messages with history (this adds the user message at the end)
-        messages = await self._build_messages(user_input, owner_id, chat_id)
-        
-        # Capture the user message (last message added by _build_messages)
-        user_message = messages[-1]
-        
-        # Capture initial length for slicing after orchestration (excluding user message)
-        initial_length = len(messages)
+        emit_observers = not bool(kwargs.pop("_skip_observer_hooks", False))
+        observer_context = self._build_request_observer_context(owner_id, chat_id, flow="invoke")
+        observer_ctx = self._ensure_observer_context_var()
+        observer_ctx_token = observer_ctx.set(observer_context)
+        request_started_at = asyncio.get_running_loop().time()
+        request_succeeded = False
+        prompt_token = None
+        formatted_tools_token = None
+        tool_map_token = None
 
-        # Snapshot mutable runtime config for this request (prompt + tools)
-        request_config = self._snapshot_request_config()
-        prompt_token = self._request_system_prompt_ctx.set(request_config["system_prompt"])
-        formatted_tools_token = self._request_formatted_tools_ctx.set(request_config["formatted_tools"])
-        tool_map_token = self._request_tool_map_ctx.set(request_config["tool_map"])
+        if emit_observers:
+            await self._emit_observer_hook(
+                "on_request_start",
+                phase="request",
+                input_chars=len(user_input),
+            )
 
         try:
+            # Build messages with history (this adds the user message at the end)
+            messages = await self._build_messages(user_input, owner_id, chat_id)
+
+            # Capture the user message (last message added by _build_messages)
+            user_message = messages[-1]
+
+            # Capture initial length for slicing after orchestration (excluding user message)
+            initial_length = len(messages)
+
+            # Snapshot mutable runtime config for this request (prompt + tools)
+            request_config = self._snapshot_request_config()
+            prompt_token = self._request_system_prompt_ctx.set(request_config["system_prompt"])
+            formatted_tools_token = self._request_formatted_tools_ctx.set(request_config["formatted_tools"])
+            tool_map_token = self._request_tool_map_ctx.set(request_config["tool_map"])
+
             # Run the agent core (this is where child classes can override _run_agent)
             final_text = await self._run_agent(messages, **kwargs)
 
@@ -330,12 +357,40 @@ class BaseAgent(ABC):
             # Store the complete interaction (user message + agent responses)
             messages_to_store = [user_message] + new_messages
             await self._store_interaction(messages_to_store, owner_id, chat_id)
+
+            request_succeeded = True
+            return final_text
+        except asyncio.CancelledError as exc:
+            if emit_observers:
+                await self._emit_observer_error(
+                    phase="request",
+                    error=exc,
+                    cancelled=True,
+                )
+            raise
+        except Exception as exc:
+            if emit_observers:
+                await self._emit_observer_error(
+                    phase="request",
+                    error=exc,
+                )
+            raise
         finally:
-            self._request_tool_map_ctx.reset(tool_map_token)
-            self._request_formatted_tools_ctx.reset(formatted_tools_token)
-            self._request_system_prompt_ctx.reset(prompt_token)
-        
-        return final_text
+            if tool_map_token is not None:
+                self._request_tool_map_ctx.reset(tool_map_token)
+            if formatted_tools_token is not None:
+                self._request_formatted_tools_ctx.reset(formatted_tools_token)
+            if prompt_token is not None:
+                self._request_system_prompt_ctx.reset(prompt_token)
+
+            if emit_observers:
+                await self._emit_observer_hook(
+                    "on_request_end",
+                    phase="request",
+                    success=request_succeeded,
+                    latency_ms=self._elapsed_ms(request_started_at),
+                )
+            observer_ctx.reset(observer_ctx_token)
     
     def invoke_sync(
         self,
@@ -405,51 +460,101 @@ class BaseAgent(ABC):
             async for chunk in agent.stream("What's the weather?"):
                 print(chunk.content, end="", flush=True)
         """
-        # Build messages with history (this adds the user message at the end)
-        messages = await self._build_messages(user_input, owner_id, chat_id)
-        
-        # Capture the user message (last message added by _build_messages)
-        user_message = messages[-1]
-        
-        # Capture initial length for slicing after orchestration (excluding user message)
-        initial_length = len(messages)
+        emit_observers = not bool(kwargs.pop("_skip_observer_hooks", False))
+        observer_context = self._build_request_observer_context(owner_id, chat_id, flow="stream")
+        observer_ctx = self._ensure_observer_context_var()
+        observer_ctx_token = observer_ctx.set(observer_context)
+        request_started_at = asyncio.get_running_loop().time()
+        request_succeeded = False
+        prompt_token = None
+        formatted_tools_token = None
+        tool_map_token = None
 
-        # Snapshot mutable runtime config for this request (prompt + tools)
-        request_config = self._snapshot_request_config()
-        prompt_token = self._request_system_prompt_ctx.set(request_config["system_prompt"])
-        formatted_tools_token = self._request_formatted_tools_ctx.set(request_config["formatted_tools"])
-        tool_map_token = self._request_tool_map_ctx.set(request_config["tool_map"])
+        if emit_observers:
+            await self._emit_observer_hook(
+                "on_request_start",
+                phase="request",
+                input_chars=len(user_input),
+            )
 
-        # Run the streaming orchestration engine
-        used_fallback_invoke = False
         try:
-            async for chunk in self._orchestrate_stream(messages, include_thinking=include_thinking, **kwargs):
-                # Yield content chunks to UI
-                if include_thinking and chunk.thinking:
-                    yield chunk
-                if chunk.content:
-                    yield chunk
-                if chunk.tool_call is not None:
-                    yield chunk
-        except NotImplementedError:
-            # Fallback for agents that don't implement streaming
-            used_fallback_invoke = True
-            final_response = await self.invoke(user_input, owner_id, chat_id, **kwargs)
-            yield StreamChunk(content=final_response, is_finished=True)
+            # Build messages with history (this adds the user message at the end)
+            messages = await self._build_messages(user_input, owner_id, chat_id)
+
+            # Capture the user message (last message added by _build_messages)
+            user_message = messages[-1]
+
+            # Capture initial length for slicing after orchestration (excluding user message)
+            initial_length = len(messages)
+
+            # Snapshot mutable runtime config for this request (prompt + tools)
+            request_config = self._snapshot_request_config()
+            prompt_token = self._request_system_prompt_ctx.set(request_config["system_prompt"])
+            formatted_tools_token = self._request_formatted_tools_ctx.set(request_config["formatted_tools"])
+            tool_map_token = self._request_tool_map_ctx.set(request_config["tool_map"])
+
+            # Run the streaming orchestration engine
+            try:
+                async for chunk in self._orchestrate_stream(messages, include_thinking=include_thinking, **kwargs):
+                    # Yield content chunks to UI
+                    if include_thinking and chunk.thinking:
+                        yield chunk
+                    if chunk.content:
+                        yield chunk
+                    if chunk.tool_call is not None:
+                        yield chunk
+            except NotImplementedError:
+                # Fallback for agents that don't implement streaming
+                final_response = await self.invoke(
+                    user_input,
+                    owner_id,
+                    chat_id,
+                    _skip_observer_hooks=True,
+                    **kwargs,
+                )
+                yield StreamChunk(content=final_response, is_finished=True)
+                request_succeeded = True
+                return
+
+            # Slice the mutated list to get only new messages (AI responses, tool calls, etc.)
+            new_messages = messages[initial_length:]
+
+            # Store the complete interaction (user message + agent responses)
+            messages_to_store = [user_message] + new_messages
+            await self._store_interaction(messages_to_store, owner_id, chat_id)
+            request_succeeded = True
+
+        except asyncio.CancelledError as exc:
+            if emit_observers:
+                await self._emit_observer_error(
+                    phase="request",
+                    error=exc,
+                    cancelled=True,
+                )
+            raise
+        except Exception as exc:
+            if emit_observers:
+                await self._emit_observer_error(
+                    phase="request",
+                    error=exc,
+                )
+            raise
         finally:
-            self._request_tool_map_ctx.reset(tool_map_token)
-            self._request_formatted_tools_ctx.reset(formatted_tools_token)
-            self._request_system_prompt_ctx.reset(prompt_token)
+            if tool_map_token is not None:
+                self._request_tool_map_ctx.reset(tool_map_token)
+            if formatted_tools_token is not None:
+                self._request_formatted_tools_ctx.reset(formatted_tools_token)
+            if prompt_token is not None:
+                self._request_system_prompt_ctx.reset(prompt_token)
 
-        if used_fallback_invoke:
-            return
-
-        # Slice the mutated list to get only new messages (AI responses, tool calls, etc.)
-        new_messages = messages[initial_length:]
-
-        # Store the complete interaction (user message + agent responses)
-        messages_to_store = [user_message] + new_messages
-        await self._store_interaction(messages_to_store, owner_id, chat_id)
+            if emit_observers:
+                await self._emit_observer_hook(
+                    "on_request_end",
+                    phase="request",
+                    success=request_succeeded,
+                    latency_ms=self._elapsed_ms(request_started_at),
+                )
+            observer_ctx.reset(observer_ctx_token)
 
     async def _build_messages(self, user_input: str, owner_id: str, chat_id: str) -> List[Message]:
         """
@@ -566,6 +671,110 @@ class BaseAgent(ABC):
         """Get request-local tool-instance map, if any."""
         return self._request_tool_map_ctx.get()
 
+    def _build_request_observer_context(self, owner_id: str, chat_id: str, flow: str) -> Dict[str, Any]:
+        """Build per-request observer metadata used to enrich hook payloads."""
+        return {
+            "request_id": str(uuid4()),
+            "owner_id": owner_id,
+            "chat_id": chat_id,
+            "flow": flow,
+            "model": self._get_model_name(),
+        }
+
+    def _ensure_observer_context_var(self) -> ContextVar[Optional[Dict[str, Any]]]:
+        observer_ctx = getattr(self, "_request_observer_ctx", None)
+        if observer_ctx is None:
+            observer_ctx = ContextVar(
+                f"base_agent_observer_{id(self)}_lazy",
+                default=None,
+            )
+            self._request_observer_ctx = observer_ctx
+        return observer_ctx
+
+    def _get_model_name(self) -> Optional[str]:
+        model_name = getattr(self.llm, "model_name", None)
+        if model_name:
+            return model_name
+        model_name = getattr(self.llm, "model", None)
+        if model_name:
+            return str(model_name)
+        if hasattr(self, "llm") and self.llm is not None:
+            return self.llm.__class__.__name__
+        return None
+
+    def _get_request_observer_context(self) -> Dict[str, Any]:
+        observer_ctx = getattr(self, "_request_observer_ctx", None)
+        if observer_ctx is None:
+            return {}
+        return observer_ctx.get() or {}
+
+    def _build_observer_event(self, phase: str, **event_fields: Any) -> Dict[str, Any]:
+        context = self._get_request_observer_context()
+        payload: Dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": context.get("request_id"),
+            "owner_id": context.get("owner_id"),
+            "chat_id": context.get("chat_id"),
+            "agent_name": getattr(self, "name", self.__class__.__name__),
+            "model": context.get("model") or self._get_model_name(),
+            "flow": context.get("flow"),
+            "phase": phase,
+        }
+        payload.update(event_fields)
+        return payload
+
+    async def _dispatch_observers(self, hook_name: str, event: Dict[str, Any]) -> None:
+        observers = list(getattr(self, "observers", []) or [])
+        if not observers:
+            return
+
+        for observer in observers:
+            hook = getattr(observer, hook_name, None)
+            if hook is None:
+                continue
+            try:
+                result = hook(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Observer '%s' failed during '%s': %s",
+                    getattr(self, "name", self.__class__.__name__),
+                    observer.__class__.__name__,
+                    hook_name,
+                    exc,
+                    exc_info=True,
+                )
+
+    async def _emit_observer_hook(self, hook_name: str, phase: str, **event_fields: Any) -> None:
+        event = self._build_observer_event(phase=phase, **event_fields)
+        await self._dispatch_observers(hook_name, event)
+
+    async def _emit_observer_error(self, phase: str, error: Exception, **event_fields: Any) -> None:
+        await self._emit_observer_hook(
+            "on_error",
+            phase=phase,
+            error=str(error),
+            error_type=type(error).__name__,
+            success=False,
+            **event_fields,
+        )
+
+    @staticmethod
+    def _usage_from_response(response: Any) -> Optional[Dict[str, int]]:
+        usage = {
+            "prompt_tokens": getattr(response, "prompt_tokens", None),
+            "completion_tokens": getattr(response, "completion_tokens", None),
+            "total_tokens": getattr(response, "total_tokens", None),
+            "thinking_tokens": getattr(response, "thinking_tokens", None),
+        }
+        filtered_usage = {key: value for key, value in usage.items() if value is not None}
+        return filtered_usage or None
+
+    @staticmethod
+    def _elapsed_ms(started_at: float) -> int:
+        return max(0, int((asyncio.get_running_loop().time() - started_at) * 1000))
+
     def _resolve_tool_execution_policy(self, tool_instance: Any) -> Optional[ToolExecutionPolicy]:
         """Return normalized execution policy for a tool instance (if configured)."""
         policy_getter = getattr(tool_instance, "get_execution_policy", None)
@@ -631,43 +840,122 @@ class BaseAgent(ABC):
             }
 
         policy = self._resolve_tool_execution_policy(tool_instance)
+        max_attempts = policy.max_attempts if policy is not None else 1
 
-        # Backward compatibility path: tools without policy keep prior behavior.
-        if policy is None:
-            try:
-                result = await tool_instance.run_async(**kwargs)
-                return {"success": True, "result": result}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-        
-        max_attempts = policy.max_attempts
         for attempt in range(1, max_attempts + 1):
+            attempt_started_at = asyncio.get_running_loop().time()
+            await self._emit_observer_hook(
+                "on_tool_call_start",
+                phase="tool",
+                tool_name=tool_name,
+                args=kwargs,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_ms=policy.timeout_ms if policy is not None else None,
+            )
+
             try:
-                if policy.timeout_seconds is not None:
+                if policy is not None and policy.timeout_seconds is not None:
                     result = await asyncio.wait_for(
                         tool_instance.run_async(**kwargs),
                         timeout=policy.timeout_seconds,
                     )
                 else:
                     result = await tool_instance.run_async(**kwargs)
-                return {"success": True, "result": result}
-            except asyncio.CancelledError:
+
+                latency_ms = self._elapsed_ms(attempt_started_at)
+                await self._emit_observer_hook(
+                    "on_tool_call_end",
+                    phase="tool",
+                    tool_name=tool_name,
+                    args=kwargs,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    latency_ms=latency_ms,
+                    success=True,
+                )
+                return {
+                    "success": True,
+                    "result": result,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                }
+            except asyncio.CancelledError as exc:
                 # Cancellation should propagate and must never be retried.
+                latency_ms = self._elapsed_ms(attempt_started_at)
+                await self._emit_observer_error(
+                    phase="tool",
+                    error=exc,
+                    tool_name=tool_name,
+                    args=kwargs,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    latency_ms=latency_ms,
+                    cancelled=True,
+                )
+                await self._emit_observer_hook(
+                    "on_tool_call_end",
+                    phase="tool",
+                    tool_name=tool_name,
+                    args=kwargs,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    latency_ms=latency_ms,
+                    cancelled=True,
+                    success=False,
+                )
                 raise
             except Exception as exc:
-                if isinstance(exc, asyncio.TimeoutError) and policy.timeout_ms is not None:
+                latency_ms = self._elapsed_ms(attempt_started_at)
+
+                if (
+                    isinstance(exc, asyncio.TimeoutError)
+                    and policy is not None
+                    and policy.timeout_ms is not None
+                ):
                     error_message = f"Tool '{tool_name}' timed out after {policy.timeout_ms} ms"
                 else:
                     error_message = str(exc)
 
                 should_retry = (
                     attempt < max_attempts
+                    and policy is not None
                     and policy.is_retryable_error(exc)
                 )
 
-                if not should_retry:
-                    return {"success": False, "error": error_message}
+                await self._emit_observer_error(
+                    phase="tool",
+                    error=exc,
+                    tool_name=tool_name,
+                    args=kwargs,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    latency_ms=latency_ms,
+                    will_retry=should_retry,
+                )
+                await self._emit_observer_hook(
+                    "on_tool_call_end",
+                    phase="tool",
+                    tool_name=tool_name,
+                    args=kwargs,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error=error_message,
+                    error_type=type(exc).__name__,
+                    will_retry=should_retry,
+                )
 
+                if not should_retry:
+                    return {
+                        "success": False,
+                        "error": error_message,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                    }
+
+                # delay uses the current 1-based attempt number.
                 delay_seconds = policy.backoff.get_delay_seconds(retry_number=attempt)
                 if self.verbose:
                     logger.warning(
@@ -680,6 +968,13 @@ class BaseAgent(ABC):
                     )
                 if delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
+
+        return {
+            "success": False,
+            "error": f"Tool '{tool_name}' failed without producing a result",
+            "attempt": max_attempts,
+            "max_attempts": max_attempts,
+        }
         
     async def _execute_tools_concurrently(self, tool_calls: List[ToolCall]) -> List[Message]:
         """
@@ -741,48 +1036,82 @@ class BaseAgent(ABC):
             accumulated_content = ""
             accumulated_thinking = ""
             accumulated_tool_calls = []
-            
-            # Call LLM with streaming
-            active_tools = formatted_tools if formatted_tools is not None else self._get_request_formatted_tools()
-            stream = self.llm.chat_completion_stream(
-                messages=messages,
-                system_message=Message(content=self._get_request_system_prompt(), role='system'),
-                tools=active_tools,
-                **kwargs
+            model_call_started_at = asyncio.get_running_loop().time()
+            await self._emit_observer_hook(
+                "on_model_call_start",
+                phase="model",
+                iteration=iteration + 1,
+                max_iterations=max_iterations,
+                message_count=len(messages),
             )
-            
-            # Stream the response
-            async for chunk in stream:
 
-                # Yield thinking contents to the UI
-                if chunk.thinking and include_thinking:
-                    yield StreamChunk(
-                        thinking=chunk.thinking,
-                        is_finished=chunk.is_finished,
-                        finish_reason=chunk.finish_reason,
-                    )
-                    accumulated_thinking += chunk.thinking or ""
+            final_finish_reason = None
+            try:
+                # Call LLM with streaming
+                active_tools = formatted_tools if formatted_tools is not None else self._get_request_formatted_tools()
+                stream = self.llm.chat_completion_stream(
+                    messages=messages,
+                    system_message=Message(content=self._get_request_system_prompt(), role='system'),
+                    tools=active_tools,
+                    **kwargs
+                )
 
-                # Yield content chunks to the UI
-                if chunk.content:
-                    yield StreamChunk(
-                        content=chunk.content,
-                        is_finished=chunk.is_finished,
-                        finish_reason=chunk.finish_reason,
-                    )
-                    accumulated_content += chunk.content
-                elif chunk.is_finished and not chunk.thinking:
-                    # Ensure callers waiting for terminal chunk get completion
-                    # signal even when model emitted no textual content
-                    # (e.g., tool-call-only turns).
-                    yield StreamChunk(
-                        is_finished=True,
-                        finish_reason=chunk.finish_reason,
-                    )
-                
-                # Accumulate tool calls JSON (silently)
-                if chunk.tool_calls:
-                    accumulated_tool_calls.extend(chunk.tool_calls)
+                # Stream the response
+                async for chunk in stream:
+                    if chunk.finish_reason is not None:
+                        final_finish_reason = chunk.finish_reason
+
+                    # Yield thinking contents to the UI
+                    if chunk.thinking and include_thinking:
+                        yield StreamChunk(
+                            thinking=chunk.thinking,
+                            is_finished=chunk.is_finished,
+                            finish_reason=chunk.finish_reason,
+                        )
+                        accumulated_thinking += chunk.thinking or ""
+
+                    # Yield content chunks to the UI
+                    if chunk.content:
+                        yield StreamChunk(
+                            content=chunk.content,
+                            is_finished=chunk.is_finished,
+                            finish_reason=chunk.finish_reason,
+                        )
+                        accumulated_content += chunk.content
+                    elif chunk.is_finished and not chunk.thinking:
+                        # Ensure callers waiting for terminal chunk get completion
+                        # signal even when model emitted no textual content
+                        # (e.g., tool-call-only turns).
+                        yield StreamChunk(
+                            is_finished=True,
+                            finish_reason=chunk.finish_reason,
+                        )
+
+                    # Accumulate tool calls JSON (silently)
+                    if chunk.tool_calls:
+                        accumulated_tool_calls.extend(chunk.tool_calls)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._emit_observer_error(
+                    phase="model",
+                    error=exc,
+                    iteration=iteration + 1,
+                    max_iterations=max_iterations,
+                    latency_ms=self._elapsed_ms(model_call_started_at),
+                )
+                raise
+
+            await self._emit_observer_hook(
+                "on_model_call_end",
+                phase="model",
+                iteration=iteration + 1,
+                max_iterations=max_iterations,
+                latency_ms=self._elapsed_ms(model_call_started_at),
+                success=True,
+                finish_reason=final_finish_reason,
+                tool_call_count=len(accumulated_tool_calls),
+            )
             
             # After streaming completes, append the accumulated AI message to history
             messages.append(Message(
@@ -914,12 +1243,45 @@ class BaseAgent(ABC):
 
         
         while iteration < max_iterations:
+            model_call_started_at = asyncio.get_running_loop().time()
+            await self._emit_observer_hook(
+                "on_model_call_start",
+                phase="model",
+                iteration=iteration + 1,
+                max_iterations=max_iterations,
+                message_count=len(messages),
+            )
+
             # Call the standard (non-streaming) LLM
-            response = await self.llm.chat_completion_async(
-                messages=messages,
-                system_message=Message(content=system_prompt, role='system'),
-                tools=formatted_tools,
-                **kwargs
+            try:
+                response = await self.llm.chat_completion_async(
+                    messages=messages,
+                    system_message=Message(content=system_prompt, role='system'),
+                    tools=formatted_tools,
+                    **kwargs
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._emit_observer_error(
+                    phase="model",
+                    error=exc,
+                    iteration=iteration + 1,
+                    max_iterations=max_iterations,
+                    latency_ms=self._elapsed_ms(model_call_started_at),
+                )
+                raise
+
+            await self._emit_observer_hook(
+                "on_model_call_end",
+                phase="model",
+                iteration=iteration + 1,
+                max_iterations=max_iterations,
+                latency_ms=self._elapsed_ms(model_call_started_at),
+                success=True,
+                finish_reason=getattr(response, "finish_reason", None),
+                usage=self._usage_from_response(response),
+                tool_call_count=len(response.tool_calls or []),
             )
             
             # Append the response message to history

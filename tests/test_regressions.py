@@ -21,6 +21,7 @@ from pymongo.errors import DuplicateKeyError
 from syndicate.memory.mongo import MongoMemory
 from syndicate.memory.sqlite_postgres import SqlitePostgresMemory
 from syndicate.mcp import MCPSubTool
+from syndicate.observability import InMemoryObserver
 from syndicate.tools.agent_tool import AgentAsTool
 from syndicate.tools.base_tool import (
     BaseTool,
@@ -1124,6 +1125,153 @@ class SummarizerAgentCompatibilityTests(IsolatedAsyncioTestCase):
                 )
 
         self.assertIn("Expected a string response", str(ctx.exception))
+
+
+class ObserverLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
+    class _LifecycleLLM:
+        provider_type = "openai"
+        model_name = "observer-test-model"
+
+        def __init__(self):
+            self.stream_calls = 0
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            return ChatResponse(
+                content="invoke-ok",
+                role="ai",
+                finish_reason="stop",
+                prompt_tokens=4,
+                completion_tokens=2,
+                total_tokens=6,
+            )
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            self.stream_calls += 1
+            if self.stream_calls == 1:
+                yield StreamChunk(
+                    tool_calls=[
+                        ToolCall(
+                            id="obs_tc_1",
+                            name="observer_tool",
+                            arguments={"value": 7},
+                        )
+                    ],
+                    is_finished=True,
+                    finish_reason="tool_calls",
+                )
+            else:
+                yield StreamChunk(content="stream-ok", is_finished=True, finish_reason="stop")
+
+    class _ObserverTool(BaseTool):
+        name = "observer_tool"
+        description = "Echoes its value"
+        execution_policy = ToolExecutionPolicy(
+            max_retries=0,
+            backoff=ToolBackoffPolicy(
+                strategy="fixed",
+                initial_delay_ms=0,
+                max_delay_ms=0,
+            ),
+        )
+
+        async def run(self, value: int = 0, **kwargs):
+            return f"value:{value}"
+
+    class _FailingObserver:
+        async def on_request_start(self, event):
+            raise RuntimeError("observer failed")
+
+        async def on_request_end(self, event):
+            raise RuntimeError("observer failed")
+
+        async def on_model_call_start(self, event):
+            raise RuntimeError("observer failed")
+
+        async def on_model_call_end(self, event):
+            raise RuntimeError("observer failed")
+
+        async def on_tool_call_start(self, event):
+            raise RuntimeError("observer failed")
+
+        async def on_tool_call_end(self, event):
+            raise RuntimeError("observer failed")
+
+        async def on_error(self, event):
+            raise RuntimeError("observer failed")
+
+    def _build_agent(self, llm_client, observers=None, tools=None):
+        return BaseAgent(
+            llm_client=llm_client,
+            memory=LocalMemory(rollover_enabled=False),
+            system_prompt="sys",
+            tools=tools or [],
+            observers=observers or [],
+            max_iterations=4,
+        )
+
+    async def test_invoke_success_emits_request_start_and_end(self):
+        observer = InMemoryObserver()
+        agent = self._build_agent(self._LifecycleLLM(), observers=[observer])
+
+        result = await agent.invoke("hello", owner_id="tenant-a", chat_id="chat-a")
+
+        self.assertEqual(result, "invoke-ok")
+        request_start_events = observer.get_events("on_request_start")
+        request_end_events = observer.get_events("on_request_end")
+
+        self.assertEqual(len(request_start_events), 1)
+        self.assertEqual(len(request_end_events), 1)
+        self.assertEqual(request_start_events[0]["flow"], "invoke")
+        self.assertEqual(request_start_events[0]["request_id"], request_end_events[0]["request_id"])
+        self.assertTrue(request_end_events[0]["success"])
+
+    async def test_stream_emits_model_and_tool_lifecycle_events(self):
+        observer = InMemoryObserver()
+        agent = self._build_agent(
+            self._LifecycleLLM(),
+            observers=[observer],
+            tools=[self._ObserverTool()],
+        )
+
+        chunks = []
+        async for chunk in agent.stream("run", owner_id="tenant-b", chat_id="chat-b"):
+            chunks.append(chunk)
+
+        self.assertTrue(any(chunk.content == "stream-ok" for chunk in chunks))
+
+        model_start_events = observer.get_events("on_model_call_start")
+        model_end_events = observer.get_events("on_model_call_end")
+        tool_start_events = observer.get_events("on_tool_call_start")
+        tool_end_events = observer.get_events("on_tool_call_end")
+
+        self.assertGreaterEqual(len(model_start_events), 2)
+        self.assertEqual(len(model_start_events), len(model_end_events))
+        self.assertEqual(len(tool_start_events), 1)
+        self.assertEqual(len(tool_end_events), 1)
+
+        tool_start = tool_start_events[0]
+        self.assertEqual(tool_start["flow"], "stream")
+        self.assertEqual(tool_start["tool_name"], "observer_tool")
+        self.assertIn("attempt", tool_start)
+        self.assertIn("max_attempts", tool_start)
+
+    async def test_observer_exception_does_not_fail_request(self):
+        failing_observer = self._FailingObserver()
+        healthy_observer = InMemoryObserver()
+        agent = self._build_agent(
+            self._LifecycleLLM(),
+            observers=[failing_observer, healthy_observer],
+        )
+
+        with self.assertLogs("syndicate.agents.base", level="WARNING") as captured:
+            result = await agent.invoke("hello")
+
+        self.assertEqual(result, "invoke-ok")
+        self.assertEqual(len(healthy_observer.get_events("on_request_end")), 1)
+        self.assertTrue(
+            any("Observer" in message and "failed" in message for message in captured.output),
+            msg="Expected observer failure warning log was not emitted",
+        )
 
 
 class ToolExecutionPolicyResilienceTests(unittest.IsolatedAsyncioTestCase):

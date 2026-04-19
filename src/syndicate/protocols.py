@@ -1,6 +1,6 @@
 """Public protocols for Syndicate consumers."""
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Dict, Protocol, runtime_checkable
 from collections.abc import AsyncGenerator
 
 from .communication_models import StreamChunk
@@ -33,4 +33,33 @@ class AgentInterface(Protocol):
         owner_id: str = "default",
         chat_id: str = "default",
     ) -> str:
+        ...
+
+
+ObserverEvent = Dict[str, Any]
+
+
+@runtime_checkable
+class Observer(Protocol):
+    """Lifecycle observer contract for request/model/tool execution hooks."""
+
+    async def on_request_start(self, event: ObserverEvent) -> None:
+        ...
+
+    async def on_request_end(self, event: ObserverEvent) -> None:
+        ...
+
+    async def on_model_call_start(self, event: ObserverEvent) -> None:
+        ...
+
+    async def on_model_call_end(self, event: ObserverEvent) -> None:
+        ...
+
+    async def on_tool_call_start(self, event: ObserverEvent) -> None:
+        ...
+
+    async def on_tool_call_end(self, event: ObserverEvent) -> None:
+        ...
+
+    async def on_error(self, event: ObserverEvent) -> None:
         ...

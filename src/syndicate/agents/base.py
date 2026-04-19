@@ -88,6 +88,8 @@ class BaseAgent(ABC):
     system_prompt: str = ""
     tools: list = None
     max_iterations: int = 5
+    max_total_tool_calls: Optional[int] = None
+    max_concurrent_tool_calls: Optional[int] = None
 
     def __init__(
         self,
@@ -96,6 +98,8 @@ class BaseAgent(ABC):
         system_prompt: Optional[str] = None,
         name: Optional[str] = None,
         tools: Optional[List] = None,
+        max_total_tool_calls: Optional[int] = None,
+        max_concurrent_tool_calls: Optional[int] = None,
         skills: Optional[List["SkillModule"]] = None,
         observers: Optional[List[Observer]] = None,
         vision_client = None,
@@ -113,6 +117,28 @@ class BaseAgent(ABC):
         self.system_prompt = kwargs.get("system_prompt", system_prompt or self.__class__.system_prompt)
         self.tools = list(kwargs.get("tools", tools or self.__class__.tools) or [])
         self.max_iterations = kwargs.get("max_iterations", self.__class__.max_iterations)
+        resolved_max_total_tool_calls = kwargs.get(
+            "max_total_tool_calls",
+            max_total_tool_calls
+            if max_total_tool_calls is not None
+            else getattr(self.__class__, "max_total_tool_calls", None),
+        )
+        resolved_max_concurrent_tool_calls = kwargs.get(
+            "max_concurrent_tool_calls",
+            max_concurrent_tool_calls
+            if max_concurrent_tool_calls is not None
+            else getattr(self.__class__, "max_concurrent_tool_calls", None),
+        )
+        self.max_total_tool_calls = self._normalize_guardrail_limit(
+            resolved_max_total_tool_calls,
+            "max_total_tool_calls",
+            allow_zero=True,
+        )
+        self.max_concurrent_tool_calls = self._normalize_guardrail_limit(
+            resolved_max_concurrent_tool_calls,
+            "max_concurrent_tool_calls",
+            allow_zero=False,
+        )
         
         self.skills: List["SkillModule"] = skills or []  # Skill modules
         self.observers: List[Observer] = list(observers or [])
@@ -775,6 +801,38 @@ class BaseAgent(ABC):
     def _elapsed_ms(started_at: float) -> int:
         return max(0, int((asyncio.get_running_loop().time() - started_at) * 1000))
 
+    @staticmethod
+    def _normalize_guardrail_limit(
+        value: Optional[int],
+        field_name: str,
+        *,
+        allow_zero: bool,
+    ) -> Optional[int]:
+        if value is None:
+            return None
+
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{field_name} must be an integer or None")
+
+        min_allowed = 0 if allow_zero else 1
+        if value < min_allowed:
+            comparator = ">="
+            raise ValueError(f"{field_name} must be {comparator} {min_allowed} or None")
+
+        return value
+
+    @staticmethod
+    def _build_tool_call_budget_error(
+        max_total_tool_calls: int,
+        dispatched_tool_calls: int,
+        requested_tool_calls: int,
+    ) -> str:
+        return (
+            "Error: Guardrail reached: max_total_tool_calls "
+            f"({max_total_tool_calls}) exceeded. "
+            f"Already dispatched={dispatched_tool_calls}, requested_batch={requested_tool_calls}."
+        )
+
     def _resolve_tool_execution_policy(self, tool_instance: Any) -> Optional[ToolExecutionPolicy]:
         """Return normalized execution policy for a tool instance (if configured)."""
         policy_getter = getattr(tool_instance, "get_execution_policy", None)
@@ -975,6 +1033,32 @@ class BaseAgent(ABC):
             "attempt": max_attempts,
             "max_attempts": max_attempts,
         }
+
+    async def _execute_tool_calls(self, tool_calls: List[ToolCall]) -> List[Any]:
+        """Execute tool calls with optional concurrency guardrail.
+
+        When ``max_concurrent_tool_calls`` is configured, execution is performed
+        in explicit batches of that size. Any remainder is handled as the final
+        partial batch.
+        """
+        if not tool_calls:
+            return []
+
+        max_concurrent_tool_calls = getattr(self, "max_concurrent_tool_calls", None)
+        if max_concurrent_tool_calls is None:
+            tool_tasks = [self.execute_tool(tc.name, **tc.arguments) for tc in tool_calls]
+            return await asyncio.gather(*tool_tasks, return_exceptions=True)
+
+        max_concurrent_tool_calls = max(1, max_concurrent_tool_calls)
+        results: List[Any] = []
+
+        for batch_start in range(0, len(tool_calls), max_concurrent_tool_calls):
+            batch = tool_calls[batch_start: batch_start + max_concurrent_tool_calls]
+            batch_tasks = [self.execute_tool(tc.name, **tc.arguments) for tc in batch]
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            results.extend(batch_results)
+
+        return results
         
     async def _execute_tools_concurrently(self, tool_calls: List[ToolCall]) -> List[Message]:
         """
@@ -982,8 +1066,7 @@ class BaseAgent(ABC):
         Takes a list of ToolCalls, runs them concurrently, and returns the exact
         List[Message] objects with role="tool" and matched tool_call_ids.
         """
-        tool_tasks = [self.execute_tool(tc.name, **tc.arguments) for tc in tool_calls]
-        results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+        results = await self._execute_tool_calls(tool_calls)
 
         tool_messages = []
         for tool_call, result in zip(tool_calls, results):
@@ -1031,6 +1114,7 @@ class BaseAgent(ABC):
         """
         max_iterations = getattr(self, 'max_iterations', 5)
         iteration = 0
+        total_tool_calls_dispatched = 0
         
         while iteration < max_iterations:
             accumulated_content = ""
@@ -1113,15 +1197,50 @@ class BaseAgent(ABC):
                 tool_call_count=len(accumulated_tool_calls),
             )
             
-            # After streaming completes, append the accumulated AI message to history
-            messages.append(Message(
-                role="ai",
-                content=accumulated_content,
-                tool_calls=accumulated_tool_calls
-            ))
-            
             # If there are tool calls, execute them and continue the loop
             if accumulated_tool_calls:
+                max_total_tool_calls = getattr(self, "max_total_tool_calls", None)
+                projected_tool_calls = total_tool_calls_dispatched + len(accumulated_tool_calls)
+
+                if (
+                    max_total_tool_calls is not None
+                    and projected_tool_calls > max_total_tool_calls
+                ):
+                    guardrail_message = self._build_tool_call_budget_error(
+                        max_total_tool_calls=max_total_tool_calls,
+                        dispatched_tool_calls=total_tool_calls_dispatched,
+                        requested_tool_calls=len(accumulated_tool_calls),
+                    )
+                    guardrail_error = RuntimeError(guardrail_message)
+                    await self._emit_observer_error(
+                        phase="tool",
+                        error=guardrail_error,
+                        guardrail="max_total_tool_calls",
+                        max_total_tool_calls=max_total_tool_calls,
+                        dispatched_tool_calls=total_tool_calls_dispatched,
+                        requested_tool_calls=len(accumulated_tool_calls),
+                    )
+
+                    if accumulated_content:
+                        messages.append(Message(role="ai", content=accumulated_content))
+                    messages.append(Message(role="ai", content=guardrail_message))
+
+                    yield StreamChunk(
+                        content=guardrail_message,
+                        is_finished=True,
+                        finish_reason="guardrail_reached",
+                    )
+                    break
+
+                total_tool_calls_dispatched = projected_tool_calls
+
+                # After guardrail checks pass, append the AI tool-call message.
+                messages.append(Message(
+                    role="ai",
+                    content=accumulated_content,
+                    tool_calls=accumulated_tool_calls
+                ))
+
                 # Emit a "start" event for every pending tool call before
                 # dispatching so consumers can show real-time step indicators.
                 for tc in accumulated_tool_calls:
@@ -1137,11 +1256,7 @@ class BaseAgent(ABC):
                 # Execute all tools concurrently.  We need per-call results to
                 # emit individual success/error events, so we fan out manually
                 # instead of going through _execute_tools_concurrently.
-                tool_tasks = [
-                    self.execute_tool(tc.name, **tc.arguments)
-                    for tc in accumulated_tool_calls
-                ]
-                raw_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+                raw_results = await self._execute_tool_calls(accumulated_tool_calls)
 
                 tool_messages = []
                 for tc, raw in zip(accumulated_tool_calls, raw_results):
@@ -1202,6 +1317,13 @@ class BaseAgent(ABC):
                 messages.extend(tool_messages)
                 iteration += 1
                 continue
+
+            # No tool calls on this model turn, append regular AI response.
+            messages.append(Message(
+                role="ai",
+                content=accumulated_content,
+                tool_calls=accumulated_tool_calls
+            ))
             
             # No tool calls - we're done
             break
@@ -1240,6 +1362,7 @@ class BaseAgent(ABC):
         
         max_iterations = getattr(self, 'max_iterations', 5)
         iteration = 0
+        total_tool_calls_dispatched = 0
 
         
         while iteration < max_iterations:
@@ -1284,15 +1407,46 @@ class BaseAgent(ABC):
                 tool_call_count=len(response.tool_calls or []),
             )
             
-            # Append the response message to history
-            messages.append(response.to_message())
-            
             # If there are tool calls, execute them and continue the loop
             if response.tool_calls:
+                max_total_tool_calls = getattr(self, "max_total_tool_calls", None)
+                projected_tool_calls = total_tool_calls_dispatched + len(response.tool_calls)
+
+                if (
+                    max_total_tool_calls is not None
+                    and projected_tool_calls > max_total_tool_calls
+                ):
+                    guardrail_message = self._build_tool_call_budget_error(
+                        max_total_tool_calls=max_total_tool_calls,
+                        dispatched_tool_calls=total_tool_calls_dispatched,
+                        requested_tool_calls=len(response.tool_calls),
+                    )
+                    guardrail_error = RuntimeError(guardrail_message)
+                    await self._emit_observer_error(
+                        phase="tool",
+                        error=guardrail_error,
+                        guardrail="max_total_tool_calls",
+                        max_total_tool_calls=max_total_tool_calls,
+                        dispatched_tool_calls=total_tool_calls_dispatched,
+                        requested_tool_calls=len(response.tool_calls),
+                    )
+
+                    if response.content:
+                        messages.append(Message(role="ai", content=response.content))
+                    messages.append(Message(role="ai", content=guardrail_message))
+                    return guardrail_message
+
+                total_tool_calls_dispatched = projected_tool_calls
+
+                # Append the response message to history only when dispatch proceeds.
+                messages.append(response.to_message())
                 tool_messages = await self._execute_tools_concurrently(response.tool_calls)
                 messages.extend(tool_messages)
                 iteration += 1
                 continue
+
+            # Append final text-only response.
+            messages.append(response.to_message())
             
             # No tool calls - return the final string content
             return response.content if hasattr(response, 'content') else str(response)
@@ -1337,6 +1491,9 @@ class BaseAgent(ABC):
             "client_type": self.llm.__class__.__name__,
             "system_prompt": self.system_prompt,
             "tools": [getattr(t, 'name', str(t)) for t in self.tools],
+            "max_iterations": self.max_iterations,
+            "max_total_tool_calls": self.max_total_tool_calls,
+            "max_concurrent_tool_calls": self.max_concurrent_tool_calls,
             "skills": self.list_skills(),  # Installed skill modules
             "has_memory": self.memory is not None,
             "history_length": None,  # async — use await agent.get_history() for actual history

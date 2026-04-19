@@ -1414,5 +1414,183 @@ class ToolExecutionPolicyResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sync_tool.calls, 2)
 
 
+class ToolGuardrailTests(unittest.IsolatedAsyncioTestCase):
+    class _InvokeGuardrailLLM:
+        provider_type = "openai"
+
+        def __init__(self, tool_call_batch_size):
+            self.tool_call_batch_size = tool_call_batch_size
+            self.calls = 0
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResponse(
+                    content="",
+                    role="ai",
+                    tool_calls=[
+                        ToolCall(
+                            id=f"guardrail_tc_{i}",
+                            name="guardrail_tool",
+                            arguments={"idx": i},
+                        )
+                        for i in range(self.tool_call_batch_size)
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return ChatResponse(content="done", role="ai", finish_reason="stop")
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            yield StreamChunk(content="unused", is_finished=True, finish_reason="stop")
+
+    class _StreamGuardrailLLM:
+        provider_type = "openai"
+
+        def __init__(self, tool_call_batch_size):
+            self.tool_call_batch_size = tool_call_batch_size
+            self.calls = 0
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            return ChatResponse(content="unused", role="ai")
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamChunk(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"stream_guardrail_tc_{i}",
+                            name="guardrail_tool",
+                            arguments={"idx": i},
+                        )
+                        for i in range(self.tool_call_batch_size)
+                    ],
+                    is_finished=True,
+                    finish_reason="tool_calls",
+                )
+            else:
+                yield StreamChunk(content="done", is_finished=True, finish_reason="stop")
+
+    class _CountingTool(BaseTool):
+        name = "guardrail_tool"
+        description = "Counts invocations"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, idx: int = 0, **kwargs):
+            self.calls += 1
+            return f"ok:{idx}"
+
+    class _ConcurrencyTrackingTool(BaseTool):
+        name = "concurrency_tool"
+        description = "Tracks concurrent executions"
+
+        def __init__(self):
+            self.calls = 0
+            self.active = 0
+            self.peak_active = 0
+            self._lock = asyncio.Lock()
+
+        async def run(self, idx: int = 0, **kwargs):
+            async with self._lock:
+                self.calls += 1
+                self.active += 1
+                if self.active > self.peak_active:
+                    self.peak_active = self.active
+
+            try:
+                await asyncio.sleep(0.03)
+                return f"ok:{idx}"
+            finally:
+                async with self._lock:
+                    self.active -= 1
+
+    class _ConcurrencyLLM:
+        provider_type = "openai"
+
+        def __init__(self, tool_call_batch_size):
+            self.tool_call_batch_size = tool_call_batch_size
+            self.calls = 0
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResponse(
+                    content="",
+                    role="ai",
+                    tool_calls=[
+                        ToolCall(
+                            id=f"conc_tc_{i}",
+                            name="concurrency_tool",
+                            arguments={"idx": i},
+                        )
+                        for i in range(self.tool_call_batch_size)
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return ChatResponse(content="done", role="ai", finish_reason="stop")
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            yield StreamChunk(content="unused", is_finished=True, finish_reason="stop")
+
+    def _build_agent(self, llm_client, tools, **kwargs):
+        return BaseAgent(
+            llm_client=llm_client,
+            memory=LocalMemory(rollover_enabled=False),
+            system_prompt="sys",
+            tools=tools,
+            max_iterations=5,
+            **kwargs,
+        )
+
+    async def test_invoke_guardrail_max_total_tool_calls_blocks_large_batch(self):
+        tool = self._CountingTool()
+        agent = self._build_agent(
+            self._InvokeGuardrailLLM(tool_call_batch_size=2),
+            tools=[tool],
+            max_total_tool_calls=1,
+        )
+
+        result = await agent.invoke("run")
+
+        self.assertIn("Guardrail reached", result)
+        self.assertIn("max_total_tool_calls", result)
+        self.assertEqual(tool.calls, 0)
+
+    async def test_stream_guardrail_emits_terminal_guardrail_reason(self):
+        tool = self._CountingTool()
+        agent = self._build_agent(
+            self._StreamGuardrailLLM(tool_call_batch_size=2),
+            tools=[tool],
+            max_total_tool_calls=1,
+        )
+
+        chunks = []
+        async for chunk in agent.stream("run"):
+            chunks.append(chunk)
+
+        self.assertGreaterEqual(len(chunks), 1)
+        terminal = chunks[-1]
+        self.assertTrue(terminal.is_finished)
+        self.assertEqual(terminal.finish_reason, "guardrail_reached")
+        self.assertIn("max_total_tool_calls", terminal.content)
+        self.assertEqual(tool.calls, 0)
+
+    async def test_max_concurrent_tool_calls_respected(self):
+        tool = self._ConcurrencyTrackingTool()
+        agent = self._build_agent(
+            self._ConcurrencyLLM(tool_call_batch_size=3),
+            tools=[tool],
+            max_concurrent_tool_calls=2,
+        )
+
+        result = await agent.invoke("run")
+
+        self.assertEqual(result, "done")
+        self.assertEqual(tool.calls, 3)
+        self.assertLessEqual(tool.peak_active, 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

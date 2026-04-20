@@ -91,6 +91,65 @@ Every `ObserverEvent` contains:
 
 ## Tool Guardrails (FR-003)
 
+Syndicate provides built-in guardrails to control agent behavior, especially during multi-turn orchestration and tool execution.
+
+### Execution Limits
+
+You can configure global limits on a `BaseAgent` to prevent runaway tool loops or cost spikes:
+
+- `max_iterations`: Maximum number of model-tool turns (default: `5`).
+- `max_total_tool_calls`: Maximum total tool executions allowed per request.
+- `max_concurrent_tool_calls`: Maximum number of tools to execute in parallel (default: all).
+
+```python
+agent = GenericAgent(
+    llm_client=client,
+    max_iterations=10,
+    max_total_tool_calls=25,
+    max_concurrent_tool_calls=5  # Execute tools in batches of 5
+)
+```
+
+### Batching Support
+When `max_concurrent_tool_calls` is set, Syndicate automatically batches tool calls within a single turn, ensuring that the local environment (network/CPU) is not overwhelmed by massive parallel execution.
+
+---
+
+## Unified Tool Envelope (FR-004)
+
+Syndicate uses a standardized `ToolResultEnvelope` to wrap all tool outcomes. This ensures that downstream logic (and the LLM) receives a consistent structure regardless of the tool's implementation.
+
+### Structured Success & Failure
+Instead of returning raw strings, the `execute_tool` logic produces a structured JSON-serializable envelope:
+
+```json
+{
+  "status": "success",
+  "tool_name": "get_weather",
+  "result": "72°F and sunny",
+  "metadata": {
+    "latency_ms": 120,
+    "attempt": 1
+  }
+}
+```
+
+In case of failure:
+```json
+{
+  "status": "error",
+  "tool_name": "get_weather",
+  "error": "Timeout after 30s",
+  "error_type": "asyncio.TimeoutError"
+}
+```
+
+This consistency protects the agent's reasoning loop from malformed tool outputs and provides the LLM with enough context to handle errors gracefully.
+
+---
+
+## Tool Guardrails (FR-003)
+
 Syndicate provides built-in safety mechanisms to prevent runaway tool loops and manage API concurrency. These guardrails are configured at the agent level and apply to all tools.
 
 ### Usage

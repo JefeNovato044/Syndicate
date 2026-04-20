@@ -335,3 +335,83 @@ class StreamChunk(BaseModel):
     
     def __str__(self) -> str:
         return self.content
+
+
+# ============================================================================
+# Agent2Agent (A2A) Protocol Models (FR-005)
+# Aligned with A2A v1.0.0 Specification for multi-agent interoperability.
+# ============================================================================
+
+class A2ASupportedInterface(BaseModel):
+    """Network bindings where the agent can be reached."""
+    url: str = Field(..., description="Endpoint URL for the A2A binding.")
+    protocolBinding: Literal["JSONRPC", "GRPC", "HTTP+JSON"] = Field(
+        default="JSONRPC", 
+        description="The transport protocol."
+    )
+    protocolVersion: str = Field(default="1.0", description="A2A protocol version.")
+
+class A2ACapabilities(BaseModel):
+    """Flags indicating supported interaction modes."""
+    streaming: bool = Field(default=True, description="Supports Server-Sent Events (SSE) streaming.")
+    pushNotifications: bool = Field(default=False, description="Supports async webhook callbacks.")
+    extendedAgentCard: bool = Field(default=False, description="Has private, authenticated capabilities.")
+
+class A2ASkill(BaseModel):
+    """A specific capability or tool this agent exposes."""
+    id: str = Field(..., description="Unique identifier for the skill (e.g., tool name).")
+    name: str = Field(..., description="Human-readable name.")
+    description: str = Field(..., description="Detailed description of what the skill does.")
+    inputModes: List[str] = Field(
+        default_factory=lambda: ["application/json"], 
+        description="MIME types accepted as input."
+    )
+    outputModes: List[str] = Field(
+        default_factory=lambda: ["application/json"], 
+        description="MIME types returned."
+    )
+    tags: Optional[List[str]] = Field(None, description="Categorization tags.")
+    examples: Optional[List[str]] = Field(None, description="Example prompts to trigger this skill.")
+
+class A2AAgentCard(BaseModel):
+    """
+    Standard A2A v1.0 Agent Card (Manifest).
+    Acts as the public discovery document for the agent.
+    """
+    name: str = Field(..., description="Display name of the agent.")
+    description: str = Field(..., description="Primary purpose of the agent.")
+    version: str = Field(default="1.0.0", description="Semantic version of the agent deployment.")
+    
+    # Metadata
+    iconUrl: Optional[str] = Field(None, description="URL to an avatar/icon.")
+    documentationUrl: Optional[str] = Field(None, description="URL to human-readable docs.")
+    
+    # Networking & Discovery
+    supportedInterfaces: List[A2ASupportedInterface] = Field(
+        default_factory=list,
+        description="Endpoints to reach the agent."
+    )
+    capabilities: A2ACapabilities = Field(
+        default_factory=A2ACapabilities,
+        description="Core interaction capabilities."
+    )
+    
+    # Data Formats
+    defaultInputModes: List[str] = Field(
+        default_factory=lambda: ["text/plain", "application/json"],
+        description="Default MIME types accepted."
+    )
+    defaultOutputModes: List[str] = Field(
+        default_factory=lambda: ["text/plain", "application/json"],
+        description="Default MIME types returned."
+    )
+    
+    # Tool/Capability Surface Area
+    skills: List[A2ASkill] = Field(
+        default_factory=list,
+        description="The publicized tools/skills this agent can perform."
+    )
+    
+    def to_json(self) -> str:
+        """Serialize the Agent Card to A2A compliant JSON."""
+        return self.model_dump_json(exclude_none=True)

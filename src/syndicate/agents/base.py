@@ -10,7 +10,14 @@ from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
-from ..communication_models import Message, ToolCall, StreamChunk, ToolCallEvent, ToolResultEnvelope
+from ..communication_models import (
+    Message, 
+    ToolCall, 
+    StreamChunk, 
+    ToolCallEvent, 
+    ToolResultEnvelope,
+    A2AAgentCard
+)
 from ..protocols import Observer
 from ..tools.base_tool import ToolExecutionPolicy
 
@@ -294,6 +301,49 @@ class BaseAgent(ABC):
     def list_skills(self) -> List[str]:
         """Get names of all installed skills."""
         return [s.name for s in self.skills]    
+
+    def get_manifest(self) -> "A2AAgentCard":
+        """
+        Generate an Agent2Agent (A2A) v1.0.0 compliant Agent Card.
+        This provides a structured summary of the agent's capabilities (skills)
+        and interaction modes, suitable for multi-agent swarm discovery.
+        """
+        from ..communication_models import A2AAgentCard, A2ASkill, A2ACapabilities
+        
+        # Build skills list dynamically from installed tools
+        skills = []
+        for tool in self.tools:
+            tool_name = getattr(tool, 'name', None) or getattr(tool, '__name__', str(tool))
+            tool_desc = getattr(tool, 'description', None) or getattr(tool, '__doc__', 'An AI capability.')
+            
+            skills.append(
+                A2ASkill(
+                    id=tool_name,
+                    name=tool_name.replace("_", " ").title(),
+                    description=tool_desc.strip(),
+                    inputModes=["application/json"],
+                    outputModes=["application/json"]
+                )
+            )
+
+        # Truncate system prompt to form the agent description
+        # Fallback to "General AI Agent" if no prompt exists.
+        agent_desc = str(self.system_prompt).strip() if self.system_prompt else "General AI Agent"
+        if len(agent_desc) > 200:
+            agent_desc = agent_desc[:200] + "..."
+
+        return A2AAgentCard(
+            name=self.name,
+            description=agent_desc,
+            version="1.0.0",
+            capabilities=A2ACapabilities(
+                streaming=True,  # Native to Syndicate via .stream()
+                pushNotifications=False,  # Can be added when we build async task observers
+                extendedAgentCard=False
+            ),
+            skills=skills,
+            # supportedInterfaces will be populated by the A2A Server Adapter later
+        )
     
     # ==================== SHELL API (State - Memory & Fallbacks) ====================
     # These methods manage Memory and Fallbacks. MUST NOT be overridden by child classes.

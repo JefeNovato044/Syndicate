@@ -1,3 +1,5 @@
+import json
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Literal, Optional, List, Any, Dict
 from datetime import datetime, timezone
@@ -150,6 +152,104 @@ class ToolCall(BaseModel):
         None, 
         description="Encrypted thinking state signature (Gemini 3+). Must be preserved and sent back for multi-turn function calling."
     )
+
+
+class ToolResultEnvelope(BaseModel):
+    """Canonical tool outcome envelope used across invoke/stream flows."""
+
+    status: Literal["success", "error"] = Field(..., description="Normalized tool execution status")
+    result: Optional[Any] = Field(None, description="Tool result payload when status='success'")
+    error: Optional[str] = Field(None, description="Error message when status='error'")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Optional execution metadata")
+
+    @model_validator(mode='after')
+    def validate_status_payload(self) -> 'ToolResultEnvelope':
+        """Ensure the status and payload fields remain coherent."""
+        if self.status == "success" and self.error:
+            raise ValueError("ToolResultEnvelope success status cannot include an error")
+        if self.status == "error" and not self.error:
+            raise ValueError("ToolResultEnvelope error status requires an error message")
+        return self
+
+    def to_json(self) -> str:
+        """Serialize envelope to JSON for Message(role='tool')."""
+        return self.model_dump_json()
+
+    @classmethod
+    def from_message_content(cls, content: Any) -> 'ToolResultEnvelope':
+        """Parse JSON tool message content into a canonical envelope.
+
+        Legacy non-JSON content is treated as a successful tool result.
+        """
+        if isinstance(content, dict):
+            payload = content
+        elif isinstance(content, str):
+            try:
+                payload = json.loads(content)
+            except (TypeError, json.JSONDecodeError):
+                return cls(status="success", result=content)
+        else:
+            return cls(status="success", result=content)
+
+        if isinstance(payload, dict) and payload.get("status") in {"success", "error"}:
+            return cls(
+                status=payload["status"],
+                result=payload.get("result"),
+                error=payload.get("error"),
+                metadata=payload.get("metadata") or {},
+            )
+
+        # Legacy dict payloads are treated as successful result bodies.
+        return cls(status="success", result=payload)
+
+    @classmethod
+    def from_tool_execution_result(cls, tool_name: str, raw_result: Any) -> 'ToolResultEnvelope':
+        """Normalize tool execution outputs to the canonical envelope."""
+        if isinstance(raw_result, Exception):
+            return cls(
+                status="error",
+                error=str(raw_result),
+                metadata={
+                    "tool_name": tool_name,
+                    "error_type": type(raw_result).__name__,
+                },
+            )
+
+        if isinstance(raw_result, dict):
+            # Already canonical envelope
+            if raw_result.get("status") in {"success", "error"}:
+                metadata = dict(raw_result.get("metadata") or {})
+                metadata.setdefault("tool_name", tool_name)
+                return cls(
+                    status=raw_result["status"],
+                    result=raw_result.get("result"),
+                    error=raw_result.get("error"),
+                    metadata=metadata,
+                )
+
+            metadata: Dict[str, Any] = {"tool_name": tool_name}
+            for key in ("attempt", "max_attempts", "latency_ms", "error_type"):
+                if key in raw_result and raw_result.get(key) is not None:
+                    metadata[key] = raw_result.get(key)
+
+            if raw_result.get("success"):
+                return cls(
+                    status="success",
+                    result=raw_result.get("result"),
+                    metadata=metadata,
+                )
+
+            return cls(
+                status="error",
+                error=raw_result.get("error") or "Unknown tool error",
+                metadata=metadata,
+            )
+
+        return cls(
+            status="success",
+            result=raw_result,
+            metadata={"tool_name": tool_name},
+        )
 
 
 class ChatResponse(BaseModel):

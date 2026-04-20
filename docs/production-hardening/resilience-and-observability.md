@@ -119,3 +119,42 @@ When `max_total_tool_calls` is reached:
 - **`stream()`**: Emits a final chunk with `finish_reason="guardrail_reached"` to signal the abrupt stop.
 
 This prevents the agent from entering infinite "tool-response-tool" loops that consume tokens and API credits.
+
+---
+
+## Unified Tool Result/Error Envelope (FR-004)
+
+Syndicate now stores tool execution outputs in a canonical JSON envelope for both `invoke()` and `stream()` orchestration paths.
+
+### Envelope Schema
+
+```json
+{
+    "status": "success",
+    "result": {"key": "value"},
+    "error": null,
+    "metadata": {
+        "tool_name": "my_tool",
+        "attempt": 1,
+        "max_attempts": 1,
+        "latency_ms": 12.4,
+        "error_type": "ValueError"
+    }
+}
+```
+
+### Field Semantics
+
+| Field | Type | Description |
+|------|------|-------------|
+| `status` | `"success" \| "error"` | Normalized terminal outcome of the tool execution. |
+| `result` | `Any \| null` | Tool return payload for successful execution. |
+| `error` | `str \| null` | Error message for failed execution. |
+| `metadata` | `dict` | Optional diagnostics such as `attempt`, `latency_ms`, and `error_type`. |
+
+### Backward Compatibility
+
+- Existing non-JSON `Message(role="tool")` content is still accepted by provider decoders.
+- Legacy plain-text tool content is interpreted as a successful result payload by compatibility fallbacks.
+
+This keeps historical memory ingestion working while making new tool outputs deterministic and easier to parse in prompts, logs, and observability pipelines.

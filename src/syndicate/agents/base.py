@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
-from ..communication_models import Message, ToolCall, StreamChunk, ToolCallEvent
+from ..communication_models import Message, ToolCall, StreamChunk, ToolCallEvent, ToolResultEnvelope
 from ..protocols import Observer
 from ..tools.base_tool import ToolExecutionPolicy
 
@@ -1034,6 +1034,14 @@ class BaseAgent(ABC):
             "max_attempts": max_attempts,
         }
 
+    @staticmethod
+    def _normalize_tool_result_envelope(tool_name: str, raw_result: Any) -> ToolResultEnvelope:
+        """Normalize raw tool execution output into canonical envelope shape."""
+        return ToolResultEnvelope.from_tool_execution_result(
+            tool_name=tool_name,
+            raw_result=raw_result,
+        )
+
     async def _execute_tool_calls(self, tool_calls: List[ToolCall]) -> List[Any]:
         """Execute tool calls with optional concurrency guardrail.
 
@@ -1070,21 +1078,13 @@ class BaseAgent(ABC):
 
         tool_messages = []
         for tool_call, result in zip(tool_calls, results):
-            if isinstance(result, Exception):
-                content_str = f"Tool error: {str(result)}"
-            elif isinstance(result, dict):
-                if result.get("success"):
-                    content_str = f"Tool '{tool_call.name}' result: {result['result']}"
-                else:
-                    content_str = f"Tool '{tool_call.name}' error: {result['error']}"
-            else:
-                content_str = f"Tool result: {result}"
+            envelope = self._normalize_tool_result_envelope(tool_call.name, result)
 
             # Append a separate message for each tool with its specific ID
             tool_messages.append(
                 Message(
                     role="tool",
-                    content=content_str,
+                    content=envelope.to_json(),
                     tool_call_id=tool_call.id
                 ))
 
@@ -1260,56 +1260,32 @@ class BaseAgent(ABC):
 
                 tool_messages = []
                 for tc, raw in zip(accumulated_tool_calls, raw_results):
-                    if isinstance(raw, Exception):
-                        content_str = f"Tool error: {str(raw)}"
+                    envelope = self._normalize_tool_result_envelope(tc.name, raw)
+                    if envelope.status == "success":
                         yield StreamChunk(
                             tool_call=ToolCallEvent(
                                 tool_call_id=tc.id,
                                 tool_name=tc.name,
                                 args=tc.arguments,
-                                error=str(raw),
-                                status="error",
+                                result=envelope.result,
+                                status="success",
                             )
                         )
-                    elif isinstance(raw, dict):
-                        if raw.get("success"):
-                            content_str = f"Tool '{tc.name}' result: {raw['result']}"
-                            yield StreamChunk(
-                                tool_call=ToolCallEvent(
-                                    tool_call_id=tc.id,
-                                    tool_name=tc.name,
-                                    args=tc.arguments,
-                                    result=raw["result"],
-                                    status="success",
-                                )
-                            )
-                        else:
-                            content_str = f"Tool '{tc.name}' error: {raw['error']}"
-                            yield StreamChunk(
-                                tool_call=ToolCallEvent(
-                                    tool_call_id=tc.id,
-                                    tool_name=tc.name,
-                                    args=tc.arguments,
-                                    error=raw.get("error"),
-                                    status="error",
-                                )
-                            )
                     else:
-                        content_str = f"Tool result: {raw}"
                         yield StreamChunk(
                             tool_call=ToolCallEvent(
                                 tool_call_id=tc.id,
                                 tool_name=tc.name,
                                 args=tc.arguments,
-                                result=raw,
-                                status="success",
+                                error=envelope.error,
+                                status="error",
                             )
                         )
 
                     tool_messages.append(
                         Message(
                             role="tool",
-                            content=content_str,
+                            content=envelope.to_json(),
                             tool_call_id=tc.id,
                         )
                     )

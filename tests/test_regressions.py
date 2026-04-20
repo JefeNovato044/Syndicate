@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator
 from syndicate.protocols import AgentInterface
 from syndicate.agents.runtime import AgentRuntime
 from syndicate.agents.base import BaseAgent
-from syndicate.communication_models import Message, ToolCall, ChatResponse, StreamChunk
+from syndicate.communication_models import Message, ToolCall, ChatResponse, StreamChunk, ToolResultEnvelope
 from syndicate.clients.gemini import GeminiClient
 from syndicate.clients.openai import OpenAIClient
 from syndicate.memory.local import LocalMemory
@@ -1086,6 +1086,161 @@ class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
             content += chunk.content  # tool_call chunks have content="" by default
 
         self.assertEqual(content, "done")
+
+
+class ToolResultEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    class _NoopLLM:
+        provider_type = "openai"
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            return ChatResponse(content="ok", role="ai")
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            yield StreamChunk(content="ok", is_finished=True)
+
+    class _StreamingLLM:
+        provider_type = "openai"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+            return ChatResponse(content="unused", role="ai")
+
+        async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamChunk(
+                    tool_calls=[
+                        ToolCall(
+                            id="env_stream_1",
+                            name="envelope_success_tool",
+                            arguments={"value": 3},
+                        )
+                    ],
+                    is_finished=True,
+                    finish_reason="tool_calls",
+                )
+            else:
+                yield StreamChunk(content="done", is_finished=True, finish_reason="stop")
+
+    class _SuccessTool(BaseTool):
+        name = "envelope_success_tool"
+        description = "Returns success payload"
+
+        async def run(self, value: int = 1, **kwargs):
+            return {"ok": True, "value": value}
+
+    class _ErrorTool(BaseTool):
+        name = "envelope_error_tool"
+        description = "Raises to produce error envelope"
+
+        async def run(self, **kwargs):
+            raise ValueError("boom-envelope")
+
+    def _build_agent(self, tools, llm_client=None):
+        return BaseAgent(
+            llm_client=llm_client or self._NoopLLM(),
+            memory=LocalMemory(rollover_enabled=False),
+            system_prompt="sys",
+            tools=tools,
+            max_iterations=4,
+        )
+
+    async def test_success_envelope_format(self):
+        agent = self._build_agent([self._SuccessTool()])
+
+        tool_messages = await agent._execute_tools_concurrently(
+            [ToolCall(id="env_ok_1", name="envelope_success_tool", arguments={"value": 7})]
+        )
+
+        self.assertEqual(len(tool_messages), 1)
+        payload = json.loads(tool_messages[0].content)
+        envelope = ToolResultEnvelope.model_validate(payload)
+
+        self.assertEqual(envelope.status, "success")
+        self.assertEqual(envelope.result, {"ok": True, "value": 7})
+        self.assertIsNone(envelope.error)
+        self.assertEqual(envelope.metadata.get("tool_name"), "envelope_success_tool")
+
+    async def test_failure_envelope_format(self):
+        agent = self._build_agent([self._ErrorTool()])
+
+        tool_messages = await agent._execute_tools_concurrently(
+            [ToolCall(id="env_err_1", name="envelope_error_tool", arguments={})]
+        )
+
+        self.assertEqual(len(tool_messages), 1)
+        payload = json.loads(tool_messages[0].content)
+        envelope = ToolResultEnvelope.model_validate(payload)
+
+        self.assertEqual(envelope.status, "error")
+        self.assertIsNone(envelope.result)
+        self.assertIn("boom-envelope", envelope.error or "")
+        self.assertEqual(envelope.metadata.get("tool_name"), "envelope_error_tool")
+        self.assertEqual(envelope.metadata.get("attempt"), 1)
+        self.assertEqual(envelope.metadata.get("max_attempts"), 1)
+
+    async def test_stream_path_persists_envelope_json_tool_message(self):
+        llm = self._StreamingLLM()
+        agent = self._build_agent([self._SuccessTool()], llm_client=llm)
+        messages = [Message(role="human", content="run")]
+
+        async for _ in agent._orchestrate_stream(messages):
+            pass
+
+        tool_messages = [msg for msg in messages if msg.role == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+
+        payload = json.loads(tool_messages[0].content)
+        envelope = ToolResultEnvelope.model_validate(payload)
+        self.assertEqual(envelope.status, "success")
+        self.assertEqual(envelope.result, {"ok": True, "value": 3})
+        self.assertEqual(envelope.metadata.get("tool_name"), "envelope_success_tool")
+
+    def test_gemini_decode_keeps_legacy_tool_message_ingestion(self):
+        client = GeminiClient.__new__(GeminiClient)
+        messages = [
+            Message(
+                role="ai",
+                content="",
+                tool_calls=[ToolCall(id="legacy_tc", name="legacy_tool", arguments={})],
+            ),
+            Message(role="tool", content="NOT_JSON", tool_call_id="legacy_tc"),
+        ]
+
+        decoded, _ = client._decode_messages(messages)
+        response_payload = decoded[1]["parts"][0]["functionResponse"]["response"]
+
+        self.assertEqual(response_payload, {"result": "NOT_JSON"})
+
+    def test_gemini_decode_accepts_canonical_tool_envelope(self):
+        client = GeminiClient.__new__(GeminiClient)
+        messages = [
+            Message(
+                role="ai",
+                content="",
+                tool_calls=[ToolCall(id="env_tc", name="envelope_tool", arguments={})],
+            ),
+            Message(
+                role="tool",
+                content=json.dumps(
+                    {
+                        "status": "success",
+                        "result": {"ok": True},
+                        "error": None,
+                        "metadata": {"tool_name": "envelope_tool"},
+                    }
+                ),
+                tool_call_id="env_tc",
+            ),
+        ]
+
+        decoded, _ = client._decode_messages(messages)
+        response_payload = decoded[1]["parts"][0]["functionResponse"]["response"]
+
+        self.assertEqual(response_payload.get("status"), "success")
+        self.assertEqual(response_payload.get("result"), {"ok": True})
 
 
 class SummarizerAgentCompatibilityTests(IsolatedAsyncioTestCase):

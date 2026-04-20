@@ -99,6 +99,11 @@ Syndicate is built for production reliability. Key resilience and observability 
   - Lifecycle Hooks and Observers
   - Structured Logging
 
+- **[Multi-Agent Discovery](docs/production-hardening/multi-agent-discovery.md)**
+  - Agent2Agent (A2A) v1.0.0 Manifests
+  - Capability Discovery (Skills, Interfaces)
+  - Interoperability with Swarms (FR-005)
+
 - **Previous Hardening Notes**
   - Per-request runtime snapshots in `BaseAgent`
   - Single-active-bucket guarantees in persistent memory

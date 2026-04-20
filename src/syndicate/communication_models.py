@@ -3,7 +3,16 @@ import json
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Literal, Optional, List, Any, Dict
 from datetime import datetime, timezone
-from collections.abc import AsyncGenerator
+
+class ToolCall(BaseModel):
+    """Represents a tool/function call from the LLM."""
+    id: str = Field(..., description="Unique identifier for this tool call")
+    name: str = Field(..., description="Name of the tool/function to call")
+    arguments: Dict[str, Any] = Field(..., description="Arguments for the tool")
+    thought_signature: Optional[bytes | str] = Field(
+        None, 
+        description="Encrypted thinking state signature (Gemini 3+). Must be preserved and sent back for multi-turn function calling."
+    )
 
 class Message(BaseModel):
     """
@@ -141,17 +150,6 @@ class MessageBucket(BaseModel):
         self.closed_at = datetime.now(timezone.utc)
         if summary:
             self.summary = summary
-
-    
-class ToolCall(BaseModel):
-    """Represents a tool/function call from the LLM."""
-    id: str = Field(..., description="Unique identifier for this tool call")
-    name: str = Field(..., description="Name of the tool/function to call")
-    arguments: Dict[str, Any] = Field(..., description="Arguments for the tool")
-    thought_signature: Optional[bytes | str] = Field(
-        None, 
-        description="Encrypted thinking state signature (Gemini 3+). Must be preserved and sent back for multi-turn function calling."
-    )
 
 
 class ToolResultEnvelope(BaseModel):

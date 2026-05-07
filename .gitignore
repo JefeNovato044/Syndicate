@@ -13,3 +13,4 @@ wheels/
 
 # AI stuff
 plans/
+.context/

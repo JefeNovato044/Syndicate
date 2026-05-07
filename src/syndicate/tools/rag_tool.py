@@ -49,6 +49,10 @@ class RAGSearchTool(BaseTool):
     - Metadata (source, page, etc.)
     - Relevance scores
     
+    Extension Points:
+        - format_results(): Override to customize full output formatting
+        - _format_single_result(): Override to customize per-result formatting
+    
     Example tool call by LLM:
         {
             "name": "search_knowledge_base",
@@ -72,17 +76,21 @@ class RAGSearchTool(BaseTool):
         self,
         vector_store: BaseVectorStore,
         top_k: int = 3,
-        use_hybrid: bool = True
+        use_hybrid: bool = True,
+        default_filter: Optional[Dict[str, Any]] = None
     ):
         """
         Args:
             vector_store: Vector store instance for searching
             top_k: Default number of results to return
             use_hybrid: Whether to use hybrid search (vector + keyword)
+            default_filter: Optional metadata filter to scope all searches
+                (e.g., {'category': 'policies'})
         """
         self.vector_store = vector_store
         self.top_k = top_k
         self.use_hybrid = use_hybrid
+        self.default_filter = default_filter
 
     def run(self, **kwargs) -> str:
         raise NotImplementedError(
@@ -94,7 +102,7 @@ class RAGSearchTool(BaseTool):
         """Execute RAG search — called by the agent's tool execution framework."""
         args = self.args_schema(**kwargs)
         result = await self._execute(args.query, args.top_k)
-        return result.get("formatted", "No results found.")
+        return self.format_results(result)
 
     async def _execute(
         self,
@@ -104,8 +112,9 @@ class RAGSearchTool(BaseTool):
         """
         Execute the search query against the vector store.
         
-        This method is called by the agent's tool execution framework
-        when the LLM decides to use this tool.
+        This method is a pure data producer — it returns structured
+        search results without formatting. Use format_results() to
+        convert the output to a display string.
         
         Args:
             query: Search query text
@@ -117,7 +126,6 @@ class RAGSearchTool(BaseTool):
                 "success": True,
                 "results": [...],
                 "count": 3,
-                "formatted": "Formatted text for LLM..."
             }
         """
         # Use provided top_k or default
@@ -129,6 +137,7 @@ class RAGSearchTool(BaseTool):
             results = await self.vector_store.search(
                 query=query,
                 k=k,
+                filter=self.default_filter,
                 use_hybrid=self.use_hybrid
             )
             
@@ -136,38 +145,13 @@ class RAGSearchTool(BaseTool):
                 return {
                     "success": True,
                     "results": [],
-                    "count": 0,
-                    "formatted": "No relevant information found in the knowledge base."
+                    "count": 0
                 }
-            
-            # Format results for LLM consumption
-            formatted_parts = []
-            for i, result in enumerate(results, 1):
-                metadata = result.get("metadata", {})
-                source = metadata.get("source", "unknown")
-                page = metadata.get("page")
-                
-                # Build source attribution
-                source_str = f"Source: {source}"
-                if page:
-                    source_str += f", Page: {page}"
-                
-                score = result.get("score") or result.get("rrf_score")
-                score_str = f" (Relevance: {score:.3f})" if score else ""
-                
-                formatted_parts.append(
-                    f"[Result {i}{score_str}]\n"
-                    f"{source_str}\n"
-                    f"{result['text']}"
-                )
-            
-            formatted = "\n\n".join(formatted_parts)
             
             return {
                 "success": True,
                 "results": results,
-                "count": len(results),
-                "formatted": formatted
+                "count": len(results)
             }
             
         except Exception as e:
@@ -175,20 +159,93 @@ class RAGSearchTool(BaseTool):
                 "success": False,
                 "error": str(e),
                 "results": [],
-                "count": 0,
-                "formatted": f"Error searching knowledge base: {str(e)}"
+                "count": 0
             }
     
-    def get_result_text(self, result: Dict[str, Any]) -> str:
-        """
-        Extract text from tool execution result for agent response.
-        
+    def _format_single_result(
+        self,
+        result: Dict[str, Any],
+        index: int
+    ) -> str:
+        """Format a single search result for LLM consumption.
+
+        Override this method in subclasses to customize per-result presentation.
+
         Args:
-            result: Result dictionary from execute()
-        
+            result: Single result dict from vector store (id, text, metadata, score)
+            index: 1-based result number
+
         Returns:
-            Formatted text to return to the agent/LLM
+            Formatted string block for this result
         """
+        metadata = result.get("metadata", {})
+        source = metadata.get("source", "unknown")
+        page = metadata.get("page")
+
+        source_str = f"Source: {source}"
+        if page:
+            source_str += f", Page: {page}"
+
+        score = result.get("score") or result.get("rrf_score")
+        score_str = f" (Relevance: {score:.3f})" if score else ""
+
+        return (
+            f"[Result {index}{score_str}]\n"
+            f"{source_str}\n"
+            f"{result['text']}"
+        )
+
+    def format_results(self, execution_result: Dict[str, Any]) -> str:
+        """Format the full execution result for the LLM.
+
+        Override this method in subclasses to customize output format,
+        include raw data, or change presentation style.
+
+        Args:
+            execution_result: Dict with keys: success, results, count, error
+
+        Returns:
+            Formatted string to return to the agent/LLM
+
+        Example::
+
+            class CitationRAGSearchTool(RAGSearchTool):
+                def format_results(self, execution_result):
+                    if not execution_result.get("success"):
+                        return execution_result.get("error", "Error.")
+                    results = execution_result["results"]
+                    citations = [
+                        f"[{i+1}] {r['text'][:200]}... (source: {r['metadata'].get('source')}, score: {r.get('score', '?'):.3f})"
+                        for i, r in enumerate(results)
+                    ]
+                    return "\n".join(citations)
+        """
+        if not execution_result.get("success"):
+            error = execution_result.get("error")
+            return f"Error searching knowledge base: {error}" if error else "Error searching knowledge base."
+
+        results = execution_result.get("results", [])
+        if not results:
+            return "No relevant information found in the knowledge base."
+
+        formatted_parts = [
+            self._format_single_result(result, i + 1)
+            for i, result in enumerate(results)
+        ]
+        return "\n\n".join(formatted_parts)
+
+    def get_result_text(self, result: Dict[str, Any]) -> str:
+        """DEPRECATED: Use _format_single_result(result, index) or format_results() instead.
+
+        Kept for backward compatibility with any external subclasses.
+        """
+        import warnings
+        warnings.warn(
+            "get_result_text() is deprecated. "
+            "Override format_results() or _format_single_result() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         if result.get("success"):
             return result.get("formatted", "")
         else:

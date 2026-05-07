@@ -630,6 +630,8 @@ Conversation memory abstraction:
 
 For semantic retrieval (RAG), use the vector store layer (`BaseVectorStore`, `MongoVectorStore`) with tools/skills such as `RAGSearchTool` and `KnowledgeBaseSkill`.
 
+`KnowledgeBaseSkill` supports prompt customization without subclassing via `instructions_template`, `instructions_mode` (`replace` or `append`), and `expertise_builder` for dynamic domain-specific instructions. See `docs/guides/agentic-rag.md` for examples.
+
 ### Skills (SkillModule)
 
 Inject domain expertise into agents via structured system-prompt sections.

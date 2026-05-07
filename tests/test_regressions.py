@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+import warnings
 from unittest import IsolatedAsyncioTestCase
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
@@ -17,12 +18,14 @@ from syndicate.clients.gemini import GeminiClient
 from syndicate.clients.openai import OpenAIClient
 from syndicate.memory.local import LocalMemory
 from syndicate.memory.summarizers import resolve_summarizer
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 from syndicate.memory.mongo import MongoMemory
 from syndicate.memory.sqlite_postgres import SqlitePostgresMemory
 from syndicate.mcp import MCPSubTool
 from syndicate.observability import InMemoryObserver
+from syndicate.skills import KnowledgeBaseSkill
 from syndicate.tools.agent_tool import AgentAsTool
+from syndicate.vectorstores.mongo import MongoVectorStore
 from syndicate.tools.base_tool import (
     BaseTool,
     ToolBackoffPolicy,
@@ -118,6 +121,63 @@ class _FakeAgentRuntimeTarget:
 
     def install_skill(self, _skill):
         return "should never be visible from runtime facade"
+
+
+class _FakeEmbeddingModel:
+    def __init__(self, query_embedding=None, batch_embeddings=None):
+        self.query_embedding = query_embedding or [0.1, 0.2]
+        self.batch_embeddings = batch_embeddings
+        self.embed_calls = []
+        self.embed_batch_calls = []
+
+    async def embed(self, text):
+        self.embed_calls.append(text)
+        return self.query_embedding
+
+    async def embed_batch(self, texts):
+        self.embed_batch_calls.append(list(texts))
+        if self.batch_embeddings is not None:
+            return self.batch_embeddings
+        return [[float(i)] for i in range(len(texts))]
+
+
+class _FakeAsyncCursor:
+    def __init__(self, results):
+        self.results = results
+        self.lengths = []
+
+    async def to_list(self, length=None):
+        self.lengths.append(length)
+        return self.results
+
+
+class _FakeMongoCollectionForVectorStore:
+    def __init__(self, *, aggregate_results=None, aggregate_error=None, find_results=None, delete_count=0):
+        self.aggregate_results = aggregate_results if aggregate_results is not None else []
+        self.aggregate_error = aggregate_error
+        self.find_results = find_results if find_results is not None else []
+        self.delete_count = delete_count
+        self.aggregate_pipelines = []
+        self.insert_many_calls = []
+        self.delete_queries = []
+        self.find_queries = []
+
+    def aggregate(self, pipeline):
+        self.aggregate_pipelines.append(pipeline)
+        if self.aggregate_error is not None:
+            raise self.aggregate_error
+        return _FakeAsyncCursor(self.aggregate_results)
+
+    async def insert_many(self, documents, ordered=False):
+        self.insert_many_calls.append({"documents": documents, "ordered": ordered})
+
+    async def delete_many(self, query):
+        self.delete_queries.append(query)
+        return SimpleNamespace(deleted_count=self.delete_count)
+
+    def find(self, query):
+        self.find_queries.append(query)
+        return _FakeAsyncCursor(self.find_results)
 
 
 class DelegationIsolationTests(unittest.IsolatedAsyncioTestCase):
@@ -824,6 +884,219 @@ class MongoMemoryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bucket.bucket_id, "existing-bucket")
         self.assertTrue(bucket.is_active)
         self.assertEqual(bucket.position, 3)
+
+
+class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):
+    def _build_store(self, embedding_model=None):
+        model = embedding_model or _FakeEmbeddingModel()
+        store = MongoVectorStore(
+            connection_string="mongodb+srv://user:pass@cluster.mongodb.net/",
+            database="test_db",
+            collection="test_collection",
+            embedding_model=model,
+            vector_dimension=2,
+        )
+        return store, model
+
+    async def test_search_defaults_to_hybrid_and_embeds_query(self):
+        store, model = self._build_store()
+        store._collection = object()  # avoid client initialization for this unit test
+        store._hybrid_search = AsyncMock(return_value=[{"id": "doc-h"}])
+        store._vector_search = AsyncMock(return_value=[{"id": "doc-v"}])
+
+        result = await store.search("benefits policy", k=5, filter={"tenant": "acme"})
+
+        self.assertEqual(result, [{"id": "doc-h"}])
+        self.assertEqual(model.embed_calls, ["benefits policy"])
+        store._hybrid_search.assert_awaited_once_with([0.1, 0.2], "benefits policy", 5, {"tenant": "acme"})
+        store._vector_search.assert_not_awaited()
+
+    async def test_search_vector_only_path_when_hybrid_disabled(self):
+        store, model = self._build_store()
+        store._collection = object()  # avoid client initialization for this unit test
+        store._hybrid_search = AsyncMock(return_value=[{"id": "doc-h"}])
+        store._vector_search = AsyncMock(return_value=[{"id": "doc-v"}])
+
+        result = await store.search("vacation days", k=2, use_hybrid=False)
+
+        self.assertEqual(result, [{"id": "doc-v"}])
+        self.assertEqual(model.embed_calls, ["vacation days"])
+        store._vector_search.assert_awaited_once_with([0.1, 0.2], 2, None)
+        store._hybrid_search.assert_not_awaited()
+
+    async def test_vector_search_builds_pipeline_with_prefilter(self):
+        fake_collection = _FakeMongoCollectionForVectorStore(
+            aggregate_results=[
+                {
+                    "_id": "doc-1",
+                    "text": "Remote policy content",
+                    "metadata": {"source": "handbook"},
+                    "score": 0.92,
+                }
+            ]
+        )
+        store, _ = self._build_store()
+        store._collection = fake_collection
+
+        result = await store._vector_search([0.3, 0.4], k=3, filter={"source": "handbook"})
+
+        self.assertEqual(len(fake_collection.aggregate_pipelines), 1)
+        pipeline = fake_collection.aggregate_pipelines[0]
+        vector_stage = pipeline[0]["$vectorSearch"]
+        self.assertEqual(vector_stage["queryVector"], [0.3, 0.4])
+        self.assertEqual(vector_stage["numCandidates"], 30)
+        self.assertEqual(vector_stage["limit"], 3)
+        self.assertEqual(
+            vector_stage["preFilter"],
+            {"metadata": {"$eq": {"source": "handbook"}}},
+        )
+        self.assertEqual(result[0]["id"], "doc-1")
+        self.assertEqual(result[0]["metadata"], {"source": "handbook"})
+        self.assertEqual(result[0]["score"], 0.92)
+
+    async def test_keyword_search_returns_empty_when_atlas_search_fails(self):
+        fake_collection = _FakeMongoCollectionForVectorStore(
+            aggregate_error=OperationFailure("$search unavailable")
+        )
+        store, _ = self._build_store()
+        store._collection = fake_collection
+
+        result = await store._keyword_search("benefits", k=4)
+
+        self.assertEqual(result, [])
+        self.assertEqual(len(fake_collection.aggregate_pipelines), 1)
+
+    async def test_hybrid_search_merges_and_limits_results(self):
+        store, _ = self._build_store()
+        store._vector_search = AsyncMock(
+            return_value=[
+                {"id": "doc-a", "text": "A", "metadata": {}},
+                {"id": "doc-b", "text": "B", "metadata": {}},
+            ]
+        )
+        store._keyword_search = AsyncMock(
+            return_value=[
+                {"id": "doc-b", "text": "B", "metadata": {}},
+                {"id": "doc-c", "text": "C", "metadata": {}},
+            ]
+        )
+
+        result = await store._hybrid_search([0.5, 0.6], "policy", k=2)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["id"], "doc-b")
+        self.assertIn("rrf_score", result[0])
+
+    async def test_add_texts_get_by_ids_and_delete_paths(self):
+        model = _FakeEmbeddingModel(batch_embeddings=[[0.01, 0.02], [0.03, 0.04]])
+        fake_collection = _FakeMongoCollectionForVectorStore(
+            find_results=[
+                {"_id": "id-1", "text": "Doc 1", "metadata": {"topic": "hr"}},
+                {"_id": "id-2", "text": "Doc 2", "metadata": None},
+            ],
+            delete_count=2,
+        )
+        store, _ = self._build_store(embedding_model=model)
+        store._collection = fake_collection
+
+        ids = await store.add_texts(
+            texts=["Doc 1", "Doc 2"],
+            metadatas=[{"topic": "hr"}, {"topic": "eng"}],
+            ids=["id-1", "id-2"],
+        )
+        fetched = await store.get_by_ids(["id-1", "id-2"])
+        deleted_selected = await store.delete(["id-1", "id-2"])
+        deleted_all = await store.delete()
+
+        self.assertEqual(ids, ["id-1", "id-2"])
+        self.assertEqual(model.embed_batch_calls, [["Doc 1", "Doc 2"]])
+        self.assertEqual(len(fake_collection.insert_many_calls), 1)
+        inserted = fake_collection.insert_many_calls[0]
+        self.assertFalse(inserted["ordered"])
+        self.assertEqual(inserted["documents"][0]["_id"], "id-1")
+        self.assertEqual(inserted["documents"][0]["embedding"], [0.01, 0.02])
+        self.assertEqual(inserted["documents"][1]["metadata"], {"topic": "eng"})
+
+        self.assertEqual(fake_collection.find_queries, [{"_id": {"$in": ["id-1", "id-2"]}}])
+        self.assertEqual(fetched[0]["id"], "id-1")
+        self.assertEqual(fetched[1]["metadata"], {})
+
+        self.assertEqual(fake_collection.delete_queries[0], {"_id": {"$in": ["id-1", "id-2"]}})
+        self.assertEqual(fake_collection.delete_queries[1], {})
+        self.assertEqual(deleted_selected, 2)
+        self.assertEqual(deleted_all, 2)
+
+
+class KnowledgeBaseSkillCustomizationTests(unittest.TestCase):
+    def _make_skill(self, **kwargs):
+        # KnowledgeBaseSkill does not access vector_store at construction time,
+        # so a simple sentinel object is sufficient for these unit tests.
+        return KnowledgeBaseSkill(vector_store=object(), **kwargs)
+
+    def test_default_expertise_contains_domain_text(self):
+        skill = self._make_skill(domain="documentacion interna")
+
+        self.assertIn("documentacion interna", skill.expertise)
+        self.assertIn("search_knowledge_base", skill.expertise)
+        self.assertEqual(skill.name, "knowledge_base")
+        self.assertIn("documentacion interna", skill.description)
+
+    def test_instructions_template_replace_mode_overrides_default_expertise(self):
+        skill = self._make_skill(
+            domain="leyes laborales",
+            instructions_template="Responde en espanol y cita fuentes de {domain}.",
+            instructions_mode="replace",
+        )
+
+        self.assertIn("Responde en espanol", skill.expertise)
+        self.assertIn("leyes laborales", skill.expertise)
+        self.assertNotIn("When to Use the Knowledge Base", skill.expertise)
+
+    def test_instructions_template_append_mode_keeps_default_expertise(self):
+        skill = self._make_skill(
+            domain="politicas HR",
+            instructions_template="IMPORTANTE: Responde solo en espanol.",
+            instructions_mode="append",
+        )
+
+        self.assertIn("When to Use the Knowledge Base", skill.expertise)
+        self.assertIn("IMPORTANTE: Responde solo en espanol.", skill.expertise)
+
+    def test_expertise_builder_is_supported(self):
+        skill = self._make_skill(
+            domain="normativa",
+            expertise_builder=lambda domain: f"Guia especializada para {domain}.",
+            instructions_mode="replace",
+        )
+
+        self.assertEqual(skill.expertise, "Guia especializada para normativa.")
+
+    def test_additional_instructions_still_append(self):
+        skill = self._make_skill(
+            instructions_template="Base custom text",
+            instructions_mode="replace",
+            additional_instructions="Anade referencias por articulo.",
+        )
+
+        self.assertIn("Base custom text", skill.expertise)
+        self.assertIn("Anade referencias por articulo.", skill.expertise)
+
+    def test_template_and_builder_are_mutually_exclusive(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_skill(
+                instructions_template="x",
+                expertise_builder=lambda domain: "y",
+            )
+
+        self.assertIn("mutually exclusive", str(ctx.exception))
+
+    def test_invalid_template_placeholder_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_skill(
+                instructions_template="Use {unknown}",
+            )
+
+        self.assertIn("instructions_template placeholder", str(ctx.exception))
 
 
 class ConcurrentDelegationTests(unittest.IsolatedAsyncioTestCase):
@@ -1745,6 +2018,137 @@ class ToolGuardrailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "done")
         self.assertEqual(tool.calls, 3)
         self.assertLessEqual(tool.peak_active, 2)
+
+
+class RAGSearchToolExtensibilityTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for RAGSearchTool extension points: format_results, _format_single_result, default_filter."""
+
+    def _make_fake_vector_store(self, results=None, search_error=None):
+        """Build a minimal fake vector store for testing."""
+        fake = _FakeAsyncHTTPClient.__new__(type("_FakeVectorStore", (), {}))
+        fake.search = AsyncMock(return_value=results)
+        return fake
+
+    def _sample_results(self):
+        return [
+            {"id": "doc1", "text": "Alpha result", "score": 0.95, "metadata": {"source": "A"}},
+            {"id": "doc2", "text": "Beta result", "score": 0.82, "metadata": {"source": "B"}},
+        ]
+
+    async def test_default_format_behavior_unchanged(self):
+        """Default format_results produces the standard multi-result block."""
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        store = self._make_fake_vector_store(results=self._sample_results())
+        tool = RAGSearchTool(vector_store=store, top_k=3)
+        execution = await tool._execute("test query")
+        output = tool.format_results(execution)
+
+        self.assertIn("Alpha result", output)
+        self.assertIn("Beta result", output)
+        self.assertIn("Relevance: 0.950", output)
+        self.assertIn("Relevance: 0.820", output)
+
+    async def test_subclass_can_override_format_results(self):
+        """A subclass can replace format_results entirely."""
+
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        class _CustomFormatTool(RAGSearchTool):
+            def format_results(self, execution_result):
+                results = execution_result.get("results", [])
+                return f"Found {len(results)} documents"
+
+        store = self._make_fake_vector_store(results=self._sample_results())
+        tool = _CustomFormatTool(vector_store=store)
+        execution = await tool._execute("test query")
+        output = tool.format_results(execution)
+
+        self.assertEqual(output, "Found 2 documents")
+
+    async def test_subclass_can_override_format_single_result(self):
+        """A subclass can override _format_single_result for per-result styling."""
+
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        class _StyledTool(RAGSearchTool):
+            def _format_single_result(self, result, index):
+                text = result.get("text", "")
+                return f"[{index}] {text.upper()}"
+
+        store = self._make_fake_vector_store(results=self._sample_results())
+        tool = _StyledTool(vector_store=store)
+        execution = await tool._execute("test query")
+        output = tool.format_results(execution)
+
+        self.assertIn("[1] ALPHA RESULT", output)
+        self.assertIn("[2] BETA RESULT", output)
+
+    async def test_filter_forwarding_with_default_filter(self):
+        """default_filter is forwarded to vector_store.search()."""
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        store = self._make_fake_vector_store(results=[])
+        tool = RAGSearchTool(vector_store=store, default_filter={"department": "engineering"})
+        await tool._execute("test query")
+
+        store.search.assert_called_once()
+        call_kwargs = store.search.call_args[1]
+        self.assertEqual(call_kwargs.get("filter"), {"department": "engineering"})
+
+    async def test_filter_forwarding_without_default_filter(self):
+        """When default_filter is None, filter=None is forwarded."""
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        store = self._make_fake_vector_store(results=[])
+        tool = RAGSearchTool(vector_store=store)
+        await tool._execute("test query")
+
+        store.search.assert_called_once()
+        call_kwargs = store.search.call_args[1]
+        self.assertIsNone(call_kwargs.get("filter"))
+
+    async def test_empty_results_message(self):
+        """format_results returns 'No results found.' for empty lists."""
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        store = self._make_fake_vector_store(results=[])
+        tool = RAGSearchTool(vector_store=store)
+        execution = await tool._execute("test query")
+        output = tool.format_results(execution)
+
+        self.assertEqual(output, "No relevant information found in the knowledge base.")
+
+    async def test_error_in_format_results_is_not_caught(self):
+        """Errors inside format_results propagate (not swallowed)."""
+
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        class _BrokenTool(RAGSearchTool):
+            def format_results(self, execution_result):
+                raise ValueError("formatting broken")
+
+        store = self._make_fake_vector_store(results=self._sample_results())
+        tool = _BrokenTool(vector_store=store)
+        execution = await tool._execute("test query")
+
+        with self.assertRaises(ValueError) as ctx:
+            tool.format_results(execution)
+        self.assertEqual(str(ctx.exception), "formatting broken")
+
+    async def test_deprecation_warning_on_get_result_text(self):
+        """Calling get_result_text emits a DeprecationWarning."""
+        from syndicate.tools.rag_tool import RAGSearchTool
+
+        store = self._make_fake_vector_store(results=self._sample_results())
+        tool = RAGSearchTool(vector_store=store)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            tool.get_result_text({"text": "hello", "score": 0.5})
+            self.assertEqual(len(w), 1)
+            self.assertTrue(issubclass(w[0].category, DeprecationWarning))
+            self.assertIn("get_result_text", str(w[0].message))
 
 
 if __name__ == "__main__":

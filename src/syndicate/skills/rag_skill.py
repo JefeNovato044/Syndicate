@@ -20,7 +20,7 @@ Example:
     ```
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from .skill_module import SkillModule
 from ..tools.rag_tool import RAGSearchTool
@@ -80,7 +80,10 @@ class KnowledgeBaseSkill(SkillModule):
         top_k: int = 4,
         use_hybrid: bool = True,
         domain: str = "knowledge base",
-        additional_instructions: Optional[str] = None
+        additional_instructions: Optional[str] = None,
+        instructions_template: Optional[str] = None,
+        instructions_mode: Literal["replace", "append"] = "replace",
+        expertise_builder: Optional[Callable[[str], str]] = None,
     ):
         """
         Args:
@@ -91,24 +94,57 @@ class KnowledgeBaseSkill(SkillModule):
                    (e.g., "company documentation", "technical manuals")
             additional_instructions: Optional additional instructions
                                    to append to the expertise
+            instructions_template: Optional custom expertise template.
+                Use "{domain}" placeholder to inject the domain.
+            instructions_mode: How to apply custom expertise text:
+                - "replace": use custom expertise only
+                - "append": keep default expertise and append custom text
+            expertise_builder: Optional callable that returns custom expertise text
+                from a domain string. Mutually exclusive with instructions_template.
         """
+        if instructions_mode not in ("replace", "append"):
+            raise ValueError("instructions_mode must be 'replace' or 'append'")
+
+        if instructions_template is not None and expertise_builder is not None:
+            raise ValueError(
+                "instructions_template and expertise_builder are mutually exclusive"
+            )
+
         # Create the search tool
         search_tool = RAGSearchTool(
             vector_store=vector_store,
             top_k=top_k,
             use_hybrid=use_hybrid
         )
-        
+
         # Build expertise description
-        expertise = self._build_expertise(domain)
+        default_expertise = self._build_expertise(domain)
+        expertise = default_expertise
+
+        custom_expertise: Optional[str] = None
+        if expertise_builder is not None:
+            custom_expertise = (expertise_builder(domain) or "").strip()
+        elif instructions_template is not None:
+            custom_expertise = self._render_instructions_template(
+                instructions_template,
+                domain,
+            )
+
+        if custom_expertise:
+            expertise = self._merge_expertise(
+                default_expertise,
+                custom_expertise,
+                instructions_mode,
+            )
         
         # Add additional instructions if provided
         if additional_instructions:
-            expertise += f"\n\n{additional_instructions}"
+            expertise += f"\n\n{additional_instructions.strip()}"
         
         # Initialize SkillModule
         super().__init__(
             name="knowledge_base",
+            description=f"Knowledge base retrieval skill for {domain}",
             expertise=expertise,
             capabilities=self._build_capabilities(),
             glossary=self._build_glossary(),
@@ -231,6 +267,36 @@ Your action:
             "relevance score": "A numerical indicator of how well a result matches the query",
             "document chunk": "A smaller piece of a larger document, optimized for search"
         }
+
+    @staticmethod
+    def _merge_expertise(
+        default_expertise: str,
+        custom_expertise: str,
+        mode: Literal["replace", "append"],
+    ) -> str:
+        """Merge default and custom expertise according to mode."""
+        if mode == "replace":
+            return custom_expertise
+        if mode == "append":
+            return f"{default_expertise}\n\n{custom_expertise}".strip()
+        raise ValueError("mode must be 'replace' or 'append'")
+
+    @staticmethod
+    def _render_instructions_template(template: str, domain: str) -> str:
+        """Render a custom expertise template with optional {domain} placeholder."""
+        try:
+            rendered = template.format(domain=domain)
+        except KeyError as exc:
+            missing_key = exc.args[0]
+            raise ValueError(
+                f"Invalid instructions_template placeholder: {{{missing_key}}}. "
+                "Use only {domain}."
+            ) from exc
+
+        rendered = rendered.strip()
+        if not rendered:
+            raise ValueError("instructions_template cannot be empty")
+        return rendered
     
     def get_search_tool(self) -> RAGSearchTool:
         """Get the RAG search tool instance.

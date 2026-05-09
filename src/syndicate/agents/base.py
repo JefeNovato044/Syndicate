@@ -16,6 +16,7 @@ from ..communication_models import (
     StreamChunk, 
     ToolCallEvent, 
     ToolResultEnvelope,
+    ChatResponse,
     A2AAgentCard
 )
 from ..protocols import Observer
@@ -667,6 +668,132 @@ class BaseAgent(ABC):
         """Clear conversation history."""
         if hasattr(self.memory, 'clear'):
             await self.memory.clear(owner_id=owner_id, chat_id=chat_id)
+
+    async def regenerate_response(
+        self,
+        owner_id: str = "default",
+        chat_id: str = "default",
+        target_index: Optional[int] = None,
+        **kwargs,
+    ) -> ChatResponse:
+        """Regenerate an AI response by truncating active history and replaying.
+
+        Behavior:
+        - Operates on active bucket history only.
+        - Uses hard delete during truncation for deterministic replay.
+        - Returns ChatResponse for API consistency with client models.
+        """
+        if self.memory is None:
+            raise ValueError("regenerate_response requires a configured memory backend")
+        if not hasattr(self.memory, "get_history") or not hasattr(self.memory, "delete_message"):
+            raise ValueError("memory backend must implement get_history and delete_message")
+
+        emit_observers = not bool(kwargs.pop("_skip_observer_hooks", False))
+        observer_context = self._build_request_observer_context(owner_id, chat_id, flow="regenerate")
+        observer_ctx = self._ensure_observer_context_var()
+        observer_ctx_token = observer_ctx.set(observer_context)
+        request_started_at = asyncio.get_running_loop().time()
+        request_succeeded = False
+        prompt_token = None
+        formatted_tools_token = None
+        tool_map_token = None
+
+        if emit_observers:
+            await self._emit_observer_hook(
+                "on_request_start",
+                phase="request",
+                action="regenerate",
+            )
+
+        try:
+            history = await self.memory.get_history(
+                owner_id=owner_id,
+                chat_id=chat_id,
+                include_context_summary=False,
+            )
+            if not history:
+                raise ValueError("No conversation history found to regenerate.")
+
+            if target_index is not None:
+                if target_index < 0 or target_index >= len(history):
+                    raise ValueError(f"Invalid target_index: {target_index}")
+                ai_index = next(
+                    (i for i in range(target_index, len(history)) if history[i].role == "ai"),
+                    None,
+                )
+            else:
+                ai_index = next(
+                    (i for i in range(len(history) - 1, -1, -1) if history[i].role == "ai"),
+                    None,
+                )
+
+            if ai_index is None:
+                raise ValueError("No AI message found to regenerate.")
+
+            # Truncate from selected AI turn to the end of active visible history.
+            delete_count = len(history) - ai_index
+            for _ in range(delete_count):
+                deleted = await self.memory.delete_message(
+                    owner_id=owner_id,
+                    chat_id=chat_id,
+                    index=ai_index,
+                    hard_delete=True,
+                )
+                if not deleted:
+                    raise RuntimeError("Failed to truncate history for regeneration")
+
+            messages = await self.get_history(owner_id, chat_id)
+            initial_length = len(messages)
+
+            # Snapshot mutable runtime config for this request (prompt + tools)
+            request_config = self._snapshot_request_config()
+            prompt_token = self._request_system_prompt_ctx.set(request_config["system_prompt"])
+            formatted_tools_token = self._request_formatted_tools_ctx.set(request_config["formatted_tools"])
+            tool_map_token = self._request_tool_map_ctx.set(request_config["tool_map"])
+
+            regenerated_text = await self._run_agent(messages, **kwargs)
+            new_messages = messages[initial_length:]
+            if not new_messages:
+                # Keep persistence resilient for custom _run_agent overrides
+                # that return text without mutating message history.
+                new_messages = [Message(role="ai", content=str(regenerated_text))]
+            await self._store_interaction(new_messages, owner_id, chat_id)
+
+            request_succeeded = True
+            return ChatResponse(content=str(regenerated_text))
+        except asyncio.CancelledError as exc:
+            if emit_observers:
+                await self._emit_observer_error(
+                    phase="request",
+                    error=exc,
+                    cancelled=True,
+                )
+            raise
+        except Exception as exc:
+            if emit_observers:
+                await self._emit_observer_error(
+                    phase="request",
+                    error=exc,
+                    action="regenerate",
+                )
+            raise
+        finally:
+            if tool_map_token is not None:
+                self._request_tool_map_ctx.reset(tool_map_token)
+            if formatted_tools_token is not None:
+                self._request_formatted_tools_ctx.reset(formatted_tools_token)
+            if prompt_token is not None:
+                self._request_system_prompt_ctx.reset(prompt_token)
+
+            if emit_observers:
+                await self._emit_observer_hook(
+                    "on_request_end",
+                    phase="request",
+                    action="regenerate",
+                    success=request_succeeded,
+                    latency_ms=self._elapsed_ms(request_started_at),
+                )
+            observer_ctx.reset(observer_ctx_token)
 
     def add_tool(self, tool) -> None:
         """Add a tool/function to the agent."""

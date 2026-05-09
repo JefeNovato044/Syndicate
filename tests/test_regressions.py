@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 import warnings
+from datetime import datetime, timezone
 from unittest import IsolatedAsyncioTestCase
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
@@ -121,6 +122,14 @@ class _FakeAgentRuntimeTarget:
 
     def install_skill(self, _skill):
         return "should never be visible from runtime facade"
+
+
+class _FakeRegenerateClient:
+    provider_type = "openai"
+    model_name = "fake-regenerate-model"
+
+    async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+        return ChatResponse(content="regenerated answer")
 
 
 class _FakeEmbeddingModel:
@@ -783,6 +792,172 @@ class LocalMemoryBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history_other[0].content, "b")
 
 
+class LocalMemoryRollbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_message_soft_delete_hides_from_history(self):
+        memory = LocalMemory(soft_delete=True)
+
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+        deleted = await memory.delete_message("owner", "chat", index=-1)
+        self.assertTrue(deleted)
+
+        history = await memory.get_history("owner", "chat")
+        self.assertEqual([m.role for m in history], ["human"])
+
+        active = await memory.get_active_bucket("owner", "chat")
+        self.assertIsNotNone(active)
+        self.assertEqual(len(active.messages), 2, "soft delete should preserve physical messages")
+
+    async def test_delete_message_hard_delete_removes_from_bucket(self):
+        memory = LocalMemory(soft_delete=False)
+
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+        deleted = await memory.delete_message("owner", "chat", index=0)
+        self.assertTrue(deleted)
+
+        history = await memory.get_history("owner", "chat")
+        self.assertEqual([m.role for m in history], ["ai"])
+
+        active = await memory.get_active_bucket("owner", "chat")
+        self.assertIsNotNone(active)
+        self.assertEqual(len(active.messages), 1, "hard delete should remove physical message")
+
+    async def test_delete_last_message_role_filter(self):
+        memory = LocalMemory(soft_delete=True)
+
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+        await memory.add_message(Message(role="human", content="u2"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a2"), "owner", "chat")
+
+        deleted = await memory.delete_last_message("owner", "chat", role="human")
+        self.assertTrue(deleted)
+
+        history = await memory.get_history("owner", "chat")
+        self.assertEqual([m.content for m in history], ["u1", "a1", "a2"])
+
+    async def test_delete_message_out_of_range_returns_false(self):
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+
+        deleted = await memory.delete_message("owner", "chat", index=10)
+        self.assertFalse(deleted)
+
+
+class SqlitePostgresMemoryDeleteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_soft_delete_hides_message_from_history(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "delete_soft.db")
+            memory = SqlitePostgresMemory(
+                database_url=f"sqlite+aiosqlite:///{db_path}",
+                soft_delete=True,
+            )
+
+            try:
+                await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+                await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+                deleted = await memory.delete_message("owner", "chat", index=-1)
+                self.assertTrue(deleted)
+
+                history = await memory.get_history("owner", "chat")
+                self.assertEqual([m.role for m in history], ["human"])
+
+                active = await memory.get_active_bucket("owner", "chat")
+                self.assertIsNotNone(active)
+                self.assertEqual(len(active.messages), 2)
+            finally:
+                if memory._engine is not None:
+                    await memory._engine.dispose()
+
+    async def test_hard_delete_removes_message_from_storage(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "delete_hard.db")
+            memory = SqlitePostgresMemory(
+                database_url=f"sqlite+aiosqlite:///{db_path}",
+                soft_delete=False,
+            )
+
+            try:
+                await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+                await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+                deleted = await memory.delete_message("owner", "chat", index=0)
+                self.assertTrue(deleted)
+
+                history = await memory.get_history("owner", "chat")
+                self.assertEqual([m.role for m in history], ["ai"])
+
+                active = await memory.get_active_bucket("owner", "chat")
+                self.assertIsNotNone(active)
+                self.assertEqual(len(active.messages), 1)
+            finally:
+                if memory._engine is not None:
+                    await memory._engine.dispose()
+
+
+class AgentRegenerateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_regenerate_last_ai_replaces_tail(self):
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="old answer"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        response = await agent.regenerate_response(owner_id="owner", chat_id="chat")
+        self.assertEqual(response.content, "regenerated answer")
+
+        history = await memory.get_history("owner", "chat")
+        self.assertEqual([m.role for m in history], ["human", "ai"])
+        self.assertEqual(history[0].content, "u1")
+        self.assertEqual(history[1].content, "regenerated answer")
+
+    async def test_regenerate_target_index_truncates_branch(self):
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+        await memory.add_message(Message(role="human", content="u2"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a2"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        response = await agent.regenerate_response(
+            owner_id="owner",
+            chat_id="chat",
+            target_index=1,
+        )
+        self.assertEqual(response.content, "regenerated answer")
+
+        history = await memory.get_history("owner", "chat")
+        self.assertEqual([m.role for m in history], ["human", "ai"])
+        self.assertEqual(history[0].content, "u1")
+        self.assertEqual(history[1].content, "regenerated answer")
+
+    async def test_regenerate_raises_without_ai_turn(self):
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        with self.assertRaises(ValueError):
+            await agent.regenerate_response(owner_id="owner", chat_id="chat")
+
+
 class SqlitePostgresMemoryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_create_bucket_keeps_single_active_bucket(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -855,6 +1030,30 @@ class _FakeMongoCollectionForDuplicateKey:
         raise DuplicateKeyError("duplicate active bucket")
 
 
+class _FakeMongoCollectionForDeleteFlow:
+    def __init__(self, active_doc):
+        self.active_doc = active_doc
+        self.update_calls = []
+
+    async def find_one(self, query, sort=None):
+        if (
+            query.get("owner_id") == self.active_doc.get("owner_id")
+            and query.get("chat_id") == self.active_doc.get("chat_id")
+            and query.get("is_active") is True
+        ):
+            return self.active_doc
+        return None
+
+    async def update_one(self, query, update):
+        self.update_calls.append((query, update))
+        if query.get("bucket_id") != self.active_doc.get("bucket_id"):
+            return None
+        payload = update.get("$set", {})
+        if "messages" in payload:
+            self.active_doc["messages"] = payload["messages"]
+        return None
+
+
 class MongoMemoryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_bucket_returns_existing_bucket_on_duplicate_key(self):
         existing_doc = {
@@ -884,6 +1083,98 @@ class MongoMemoryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bucket.bucket_id, "existing-bucket")
         self.assertTrue(bucket.is_active)
         self.assertEqual(bucket.position, 3)
+
+
+class MongoMemoryDeleteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_soft_delete_hides_message_from_history(self):
+        active_doc = {
+            "bucket_id": "bucket-1",
+            "owner_id": "owner",
+            "chat_id": "chat",
+            "messages": [
+                {
+                    "role": "human",
+                    "content": "u1",
+                    "timestamp": datetime.now(timezone.utc),
+                },
+                {
+                    "role": "ai",
+                    "content": "a1",
+                    "timestamp": datetime.now(timezone.utc),
+                },
+            ],
+            "summary": None,
+            "is_active": True,
+            "position": 0,
+        }
+        fake_collection = _FakeMongoCollectionForDeleteFlow(active_doc)
+
+        memory = MongoMemory.__new__(MongoMemory)
+        memory._collection = fake_collection
+        memory._indexes_created = True
+        memory.soft_delete = True
+
+        async def _noop_indexes():
+            return None
+
+        memory._ensure_indexes = _noop_indexes
+
+        deleted = await memory.delete_message("owner", "chat", index=-1)
+        self.assertTrue(deleted)
+
+        history = await memory.get_history(
+            "owner",
+            "chat",
+            include_context_summary=False,
+        )
+        self.assertEqual([m.role for m in history], ["human"])
+        self.assertEqual(len(active_doc["messages"]), 2)
+        self.assertTrue(active_doc["messages"][1].get("$deleted", False))
+
+    async def test_hard_delete_removes_message_from_storage(self):
+        active_doc = {
+            "bucket_id": "bucket-2",
+            "owner_id": "owner",
+            "chat_id": "chat",
+            "messages": [
+                {
+                    "role": "human",
+                    "content": "u1",
+                    "timestamp": datetime.now(timezone.utc),
+                },
+                {
+                    "role": "ai",
+                    "content": "a1",
+                    "timestamp": datetime.now(timezone.utc),
+                },
+            ],
+            "summary": None,
+            "is_active": True,
+            "position": 0,
+        }
+        fake_collection = _FakeMongoCollectionForDeleteFlow(active_doc)
+
+        memory = MongoMemory.__new__(MongoMemory)
+        memory._collection = fake_collection
+        memory._indexes_created = True
+        memory.soft_delete = False
+
+        async def _noop_indexes():
+            return None
+
+        memory._ensure_indexes = _noop_indexes
+
+        deleted = await memory.delete_message("owner", "chat", index=0)
+        self.assertTrue(deleted)
+
+        history = await memory.get_history(
+            "owner",
+            "chat",
+            include_context_summary=False,
+        )
+        self.assertEqual([m.role for m in history], ["ai"])
+        self.assertEqual(len(active_doc["messages"]), 1)
+        self.assertEqual(active_doc["messages"][0]["role"], "ai")
 
 
 class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):

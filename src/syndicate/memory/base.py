@@ -27,6 +27,7 @@ class BaseChatMemory(ABC):
         summarizer: Optional["Summarizer"] = None,
         preserve_closed_buckets: bool = True,
         supports_summarization: bool = True,
+        soft_delete: bool = True,
     ):
         """
         Initialize chat memory with optional rollover configuration.
@@ -46,6 +47,9 @@ class BaseChatMemory(ABC):
             supports_summarization: If False, rollover will be disabled or
                 summarizer validation will be skipped. Set to False for memory
                 types that don't support summarization (e.g., LocalMemory).
+            soft_delete: If True, deletion APIs will mark messages as deleted
+                and hide them from history. If False, deletion APIs will remove
+                messages permanently.
         
         Raises:
             ValueError: If rollover_enabled=True and supports_summarization=True
@@ -57,6 +61,7 @@ class BaseChatMemory(ABC):
         self.summarizer = summarizer
         self.preserve_closed_buckets = preserve_closed_buckets
         self.supports_summarization = supports_summarization
+        self.soft_delete = soft_delete
         
         # Validation - only required if rollover is enabled AND this memory type
         # supports summarization
@@ -154,6 +159,58 @@ class BaseChatMemory(ABC):
             Number of messages in active bucket
         """
         pass
+
+    @abstractmethod
+    async def delete_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        index: int = -1,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete one message from active history by visible index.
+
+        Args:
+            owner_id: User/owner identifier.
+            chat_id: Conversation/session identifier.
+            index: Visible message index (supports negative indexing).
+            hard_delete: Optional per-call override. If True, remove message
+                permanently. If False, mark as deleted. If None, use
+                memory-level soft_delete configuration.
+
+        Returns:
+            True when a message was deleted, False otherwise.
+        """
+        pass
+
+    @abstractmethod
+    async def delete_last_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        role: Optional[str] = None,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete the last visible message, optionally constrained by role.
+
+        Args:
+            owner_id: User/owner identifier.
+            chat_id: Conversation/session identifier.
+            role: Optional normalized role filter (human/ai/system/tool).
+            hard_delete: Optional per-call override. If True, remove message
+                permanently. If False, mark as deleted. If None, use
+                memory-level soft_delete configuration.
+
+        Returns:
+            True when a message was deleted, False otherwise.
+        """
+        pass
+
+    def _should_hard_delete(self, hard_delete: Optional[bool]) -> bool:
+        """Resolve effective deletion mode from call override + config."""
+        if hard_delete is None:
+            return not self.soft_delete
+        return bool(hard_delete)
     
     # =========================================================================
     # BUCKET MANAGEMENT - Abstract methods for bucket operations

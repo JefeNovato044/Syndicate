@@ -104,6 +104,11 @@ Syndicate is built for production reliability. Key resilience and observability 
   - Capability Discovery (Skills, Interfaces)
   - Interoperability with Swarms (FR-005)
 
+- **[Memory Rollback & Regeneration](docs/guides/memory-rollback.md)**
+  - Soft vs Hard Deletion
+  - Regenerating Agent responses
+  - Backend support (Mongo, SQL, Local)
+
 - **Previous Hardening Notes**
   - Per-request runtime snapshots in `BaseAgent`
   - Single-active-bucket guarantees in persistent memory

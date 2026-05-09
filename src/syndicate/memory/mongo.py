@@ -67,6 +67,7 @@ class MongoMemory(BaseChatMemory):
         max_tokens_per_bucket: Optional[int] = None,
         summarizer: Optional[Summarizer] = None,
         preserve_closed_buckets: bool = True,
+        soft_delete: bool = True,
     ):
         """
         Initialize MongoDB memory with database connection.
@@ -86,6 +87,8 @@ class MongoMemory(BaseChatMemory):
                 Required if rollover_enabled=True.
             preserve_closed_buckets: If True, closed buckets are kept in storage.
                 If False, only the summary is preserved and messages are deleted.
+            soft_delete: If True, deletion APIs mark messages as deleted and
+                filter them from history. If False, messages are removed.
         """
         super().__init__(
             rollover_enabled=rollover_enabled,
@@ -94,6 +97,7 @@ class MongoMemory(BaseChatMemory):
             summarizer=summarizer,
             preserve_closed_buckets=preserve_closed_buckets,
             supports_summarization=True,
+            soft_delete=soft_delete,
         )
 
         self._database = database
@@ -217,8 +221,6 @@ class MongoMemory(BaseChatMemory):
         Returns:
             List of Messages in chronological order
         """
-        await self._ensure_indexes()
-
         messages: List[Message] = []
 
         # Include context summary if requested
@@ -231,12 +233,16 @@ class MongoMemory(BaseChatMemory):
                     content=f"Previous conversation context:\n{context}"
                 ))
 
-        # Get active bucket messages
-        bucket = await self.get_active_bucket(owner_id, chat_id)
-        if bucket is None:
+        # Read active bucket document so soft-delete markers are preserved.
+        doc = await self._get_active_bucket_doc(owner_id, chat_id)
+        if doc is None:
             return messages
 
-        bucket_messages = bucket.messages.copy()
+        bucket_messages = [
+            self._dict_to_message(raw)
+            for raw in doc.get("messages", [])
+            if not raw.get("$deleted", False)
+        ]
         if limit is not None:
             bucket_messages = bucket_messages[-limit:]
 
@@ -274,6 +280,84 @@ class MongoMemory(BaseChatMemory):
             return 0
         return bucket.message_count()
 
+    async def delete_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        index: int = -1,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete one visible message from the active bucket by index."""
+        doc = await self._get_active_bucket_doc(owner_id, chat_id)
+        if doc is None:
+            return False
+
+        raw_messages = list(doc.get("messages", []))
+        visible_positions = [
+            i for i, msg in enumerate(raw_messages)
+            if not msg.get("$deleted", False)
+        ]
+        if not visible_positions:
+            return False
+
+        visible_index = self._normalize_index(index, len(visible_positions))
+        if visible_index is None:
+            return False
+
+        target_index = visible_positions[visible_index]
+        if self._should_hard_delete(hard_delete):
+            raw_messages.pop(target_index)
+        else:
+            raw_messages[target_index]["$deleted"] = True
+            raw_messages[target_index]["$deleted_at"] = datetime.now(timezone.utc).isoformat()
+
+        await self._collection.update_one(
+            {"bucket_id": doc["bucket_id"]},
+            {"$set": {"messages": raw_messages}},
+        )
+        return True
+
+    async def delete_last_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        role: Optional[str] = None,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete the last visible message, optionally filtered by role."""
+        role_filter = self._normalize_role_filter(role)
+
+        doc = await self._get_active_bucket_doc(owner_id, chat_id)
+        if doc is None:
+            return False
+
+        raw_messages = list(doc.get("messages", []))
+        target_index: Optional[int] = None
+
+        for idx in range(len(raw_messages) - 1, -1, -1):
+            message = raw_messages[idx]
+            if message.get("$deleted", False):
+                continue
+            if role_filter is not None and message.get("role") != role_filter:
+                continue
+            target_index = idx
+            break
+
+        if target_index is None:
+            return False
+
+        if self._should_hard_delete(hard_delete):
+            raw_messages.pop(target_index)
+        else:
+            raw_messages[target_index]["$deleted"] = True
+            raw_messages[target_index]["$deleted_at"] = datetime.now(timezone.utc).isoformat()
+
+        await self._collection.update_one(
+            {"bucket_id": doc["bucket_id"]},
+            {"$set": {"messages": raw_messages}},
+        )
+        return True
+
     # =========================================================================
     # BUCKET MANAGEMENT METHODS
     # =========================================================================
@@ -293,16 +377,7 @@ class MongoMemory(BaseChatMemory):
         Returns:
             The active MessageBucket, or None if no bucket exists
         """
-        await self._ensure_indexes()
-
-        doc = await self._collection.find_one(
-            {
-                "owner_id": owner_id,
-                "chat_id": chat_id,
-                "is_active": True,
-            },
-            sort=[("position", DESCENDING)],
-        )
+        doc = await self._get_active_bucket_doc(owner_id, chat_id)
 
         if doc is None:
             return None
@@ -473,6 +548,22 @@ class MongoMemory(BaseChatMemory):
     # UTILITY METHODS
     # =========================================================================
 
+    async def _get_active_bucket_doc(
+        self,
+        owner_id: str,
+        chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch active bucket document for a conversation."""
+        await self._ensure_indexes()
+        return await self._collection.find_one(
+            {
+                "owner_id": owner_id,
+                "chat_id": chat_id,
+                "is_active": True,
+            },
+            sort=[("position", DESCENDING)],
+        )
+
     def _message_to_dict(self, message: Message) -> Dict[str, Any]:
         """Convert a Message to a MongoDB-storable dict."""
         doc = {
@@ -599,6 +690,33 @@ class MongoMemory(BaseChatMemory):
             "closed_buckets": closed_buckets,
             "total_buckets": total_buckets,
         }
+
+    @staticmethod
+    def _normalize_index(index: int, length: int) -> Optional[int]:
+        """Convert Python-style negative index to non-negative index."""
+        if length <= 0:
+            return None
+        if index < 0:
+            index = length + index
+        if 0 <= index < length:
+            return index
+        return None
+
+    @staticmethod
+    def _normalize_role_filter(role: Optional[str]) -> Optional[str]:
+        """Normalize optional role filter to core role names."""
+        if role is None:
+            return None
+        normalized = role.lower().strip()
+        if normalized in ("user", "person", "human"):
+            return "human"
+        if normalized in ("model", "bot", "agent", "assistant", "ai"):
+            return "ai"
+        if normalized in ("system", "sys", "instruction", "developer"):
+            return "system"
+        if normalized in ("tool", "function", "observation"):
+            return "tool"
+        return normalized
 
     async def __aenter__(self):
         """Async context manager entry."""

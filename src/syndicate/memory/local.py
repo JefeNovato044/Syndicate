@@ -5,7 +5,7 @@ Provides simple RAM-based storage for conversation history.
 No summarization support - messages are stored as-is.
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from datetime import datetime, timezone
 from .base import BaseChatMemory
 from ..communication_models import Message, MessageBucket
@@ -36,6 +36,7 @@ class LocalMemory(BaseChatMemory):
         max_tokens_per_bucket: Optional[int] = None,
         summarizer: Optional[Summarizer] = None,
         preserve_closed_buckets: bool = True,
+        soft_delete: bool = True,
     ):
         """
         Initialize local memory with optional rollover configuration.
@@ -52,6 +53,8 @@ class LocalMemory(BaseChatMemory):
                 If False, only the summary is preserved and messages are deleted.
                 Note: In LocalMemory, this only affects whether inactive buckets
                 are kept in memory.
+            soft_delete: If True, deletion APIs mark messages as deleted and
+                filter them from history. If False, messages are removed.
         """
         # Note: summarizer is accepted for API compatibility but not used
         super().__init__(
@@ -61,12 +64,15 @@ class LocalMemory(BaseChatMemory):
             summarizer=None,  # No summarization support
             preserve_closed_buckets=preserve_closed_buckets,
             supports_summarization=False,  # LocalMemory doesn't support summarization
+            soft_delete=soft_delete,
         )
         
         # Active bucket storage: { (owner_id, chat_id): MessageBucket }
         self._buckets: Dict[tuple, MessageBucket] = {}
         # Closed bucket storage: { (owner_id, chat_id): [MessageBucket, ...] }
         self._closed_buckets: Dict[tuple, List[MessageBucket]] = {}
+        # Soft-delete tombstones keyed by conversation.
+        self._deleted_message_ids: Dict[tuple, Set[str]] = {}
 
     # =========================================================================
     # ABSTRACT METHODS - Core Chat Memory Operations
@@ -132,7 +138,12 @@ class LocalMemory(BaseChatMemory):
         if bucket is None:
             return []
         
-        messages = bucket.messages.copy()
+        key = (owner_id, chat_id)
+        deleted_ids = self._deleted_message_ids.get(key, set())
+        messages = [
+            msg for msg in bucket.messages
+            if self._message_id(msg) not in deleted_ids
+        ]
         
         if limit is not None:
             messages = messages[-limit:]  # Get most recent messages
@@ -152,6 +163,8 @@ class LocalMemory(BaseChatMemory):
             del self._buckets[key]
         if key in self._closed_buckets:
             del self._closed_buckets[key]
+        if key in self._deleted_message_ids:
+            del self._deleted_message_ids[key]
 
     async def get_message_count(self, owner_id: str, chat_id: str) -> int:
         """
@@ -168,6 +181,83 @@ class LocalMemory(BaseChatMemory):
         if bucket is None:
             return 0
         return bucket.message_count()
+
+    async def delete_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        index: int = -1,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete one visible message from the active bucket by index."""
+        bucket = await self.get_active_bucket(owner_id, chat_id)
+        if bucket is None or not bucket.messages:
+            return False
+
+        key = (owner_id, chat_id)
+        deleted_ids = self._deleted_message_ids.setdefault(key, set())
+        visible_positions = [
+            i for i, msg in enumerate(bucket.messages)
+            if self._message_id(msg) not in deleted_ids
+        ]
+        if not visible_positions:
+            return False
+
+        visible_index = self._normalize_index(index, len(visible_positions))
+        if visible_index is None:
+            return False
+
+        actual_index = visible_positions[visible_index]
+        target_message = bucket.messages[actual_index]
+        target_id = self._message_id(target_message)
+
+        if self._should_hard_delete(hard_delete):
+            bucket.messages.pop(actual_index)
+            deleted_ids.discard(target_id)
+        else:
+            deleted_ids.add(target_id)
+
+        if not deleted_ids:
+            self._deleted_message_ids.pop(key, None)
+
+        return True
+
+    async def delete_last_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        role: Optional[str] = None,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete the last visible message, optionally filtered by role."""
+        bucket = await self.get_active_bucket(owner_id, chat_id)
+        if bucket is None or not bucket.messages:
+            return False
+
+        role_filter = self._normalize_role_filter(role)
+        key = (owner_id, chat_id)
+        deleted_ids = self._deleted_message_ids.setdefault(key, set())
+
+        for index in range(len(bucket.messages) - 1, -1, -1):
+            message = bucket.messages[index]
+            message_id = self._message_id(message)
+            if message_id in deleted_ids:
+                continue
+            if role_filter is not None and message.role != role_filter:
+                continue
+
+            if self._should_hard_delete(hard_delete):
+                bucket.messages.pop(index)
+                deleted_ids.discard(message_id)
+            else:
+                deleted_ids.add(message_id)
+
+            if not deleted_ids:
+                self._deleted_message_ids.pop(key, None)
+
+            return True
+
+        return False
 
     # =========================================================================
     # BUCKET MANAGEMENT METHODS
@@ -366,6 +456,38 @@ class LocalMemory(BaseChatMemory):
             "closed_buckets": closed_buckets,
             "total_buckets": active_buckets + closed_buckets,
         }
+
+    @staticmethod
+    def _normalize_index(index: int, length: int) -> Optional[int]:
+        """Convert Python-style negative index to non-negative index."""
+        if length <= 0:
+            return None
+        if index < 0:
+            index = length + index
+        if 0 <= index < length:
+            return index
+        return None
+
+    @staticmethod
+    def _message_id(message: Message) -> str:
+        """Stable in-process identifier for deletion tombstones."""
+        return message.timestamp.isoformat()
+
+    @staticmethod
+    def _normalize_role_filter(role: Optional[str]) -> Optional[str]:
+        """Normalize optional role filter to core role names."""
+        if role is None:
+            return None
+        normalized = role.lower().strip()
+        if normalized in ("user", "person", "human"):
+            return "human"
+        if normalized in ("model", "bot", "agent", "assistant", "ai"):
+            return "ai"
+        if normalized in ("system", "sys", "instruction", "developer"):
+            return "system"
+        if normalized in ("tool", "function", "observation"):
+            return "tool"
+        return normalized
 
     async def __aenter__(self):
         """Async context manager entry."""

@@ -170,6 +170,7 @@ class SqlitePostgresMemory(BaseChatMemory):
         max_tokens_per_bucket: Optional[int] = None,
         summarizer: Optional[Summarizer] = None,
         preserve_closed_buckets: bool = True,
+        soft_delete: bool = True,
     ):
         """
         Initialize SQLite/PostgreSQL memory with database connection.
@@ -190,6 +191,8 @@ class SqlitePostgresMemory(BaseChatMemory):
                 Required if rollover_enabled=True.
             preserve_closed_buckets: If True, closed buckets are kept in storage.
                 If False, only the summary is preserved and messages are deleted.
+            soft_delete: If True, deletion APIs mark messages as deleted and
+                filter them from history. If False, messages are removed.
         """
         super().__init__(
             rollover_enabled=rollover_enabled,
@@ -198,6 +201,7 @@ class SqlitePostgresMemory(BaseChatMemory):
             summarizer=summarizer,
             preserve_closed_buckets=preserve_closed_buckets,
             supports_summarization=True,
+            soft_delete=soft_delete,
         )
         
         self._database_url = database_url
@@ -354,16 +358,30 @@ class SqlitePostgresMemory(BaseChatMemory):
                     content=f"Previous conversation context:\n{context}"
                 ))
         
-        # Get active bucket messages
-        bucket = await self.get_active_bucket(owner_id, chat_id)
-        if bucket is None:
+        async with self._get_session() as session:
+            M = self._bucket_model
+            result = await session.execute(
+                select(M.messages).where(
+                    M.owner_id == owner_id,
+                    M.chat_id == chat_id,
+                    M.is_active.is_(True)
+                ).order_by(M.position.desc()).limit(1)
+            )
+            row = result.first()
+
+        if row is None:
             return messages
-        
-        bucket_messages = bucket.messages.copy()
+
+        raw_messages = json.loads(row.messages or "[]")
+        visible_messages = [
+            self._dict_to_message(raw)
+            for raw in raw_messages
+            if not raw.get("$deleted", False)
+        ]
         if limit is not None:
-            bucket_messages = bucket_messages[-limit:]
-        
-        messages.extend(bucket_messages)
+            visible_messages = visible_messages[-limit:]
+
+        messages.extend(visible_messages)
         return messages
 
     async def clear(self, owner_id: str, chat_id: str) -> None:
@@ -401,6 +419,107 @@ class SqlitePostgresMemory(BaseChatMemory):
         if bucket is None:
             return 0
         return bucket.message_count()
+
+    async def delete_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        index: int = -1,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete one visible message from the active bucket by index."""
+        await self._ensure_tables()
+
+        async with self._get_session() as session:
+            async with session.begin():
+                M = self._bucket_model
+                stmt = select(M).where(
+                    M.owner_id == owner_id,
+                    M.chat_id == chat_id,
+                    M.is_active.is_(True)
+                ).order_by(M.position.desc()).limit(1)
+                if not self._database_url.startswith("sqlite"):
+                    stmt = stmt.with_for_update()
+
+                result = await session.execute(stmt)
+                db_bucket = result.scalar_one_or_none()
+                if db_bucket is None:
+                    return False
+
+                raw_messages = json.loads(db_bucket.messages or "[]")
+                visible_positions = [
+                    i for i, msg in enumerate(raw_messages)
+                    if not msg.get("$deleted", False)
+                ]
+                if not visible_positions:
+                    return False
+
+                visible_index = self._normalize_index(index, len(visible_positions))
+                if visible_index is None:
+                    return False
+
+                target_index = visible_positions[visible_index]
+                if self._should_hard_delete(hard_delete):
+                    raw_messages.pop(target_index)
+                else:
+                    raw_messages[target_index]["$deleted"] = True
+                    raw_messages[target_index]["$deleted_at"] = datetime.now(timezone.utc).isoformat()
+
+                db_bucket.messages = json.dumps(raw_messages)
+
+        return True
+
+    async def delete_last_message(
+        self,
+        owner_id: str,
+        chat_id: str,
+        role: Optional[str] = None,
+        hard_delete: Optional[bool] = None,
+    ) -> bool:
+        """Delete the last visible message, optionally filtered by role."""
+        await self._ensure_tables()
+        role_filter = self._normalize_role_filter(role)
+
+        async with self._get_session() as session:
+            async with session.begin():
+                M = self._bucket_model
+                stmt = select(M).where(
+                    M.owner_id == owner_id,
+                    M.chat_id == chat_id,
+                    M.is_active.is_(True)
+                ).order_by(M.position.desc()).limit(1)
+                if not self._database_url.startswith("sqlite"):
+                    stmt = stmt.with_for_update()
+
+                result = await session.execute(stmt)
+                db_bucket = result.scalar_one_or_none()
+                if db_bucket is None:
+                    return False
+
+                raw_messages = json.loads(db_bucket.messages or "[]")
+                target_index: Optional[int] = None
+
+                for idx in range(len(raw_messages) - 1, -1, -1):
+                    message = raw_messages[idx]
+                    if message.get("$deleted", False):
+                        continue
+                    if role_filter is not None and message.get("role") != role_filter:
+                        continue
+                    target_index = idx
+                    break
+
+                if target_index is None:
+                    return False
+
+                if self._should_hard_delete(hard_delete):
+                    raw_messages.pop(target_index)
+                else:
+                    raw_messages[target_index]["$deleted"] = True
+                    raw_messages[target_index]["$deleted_at"] = datetime.now(timezone.utc).isoformat()
+
+                db_bucket.messages = json.dumps(raw_messages)
+
+        return True
 
     # =========================================================================
     # BUCKET MANAGEMENT METHODS
@@ -787,3 +906,30 @@ class SqlitePostgresMemory(BaseChatMemory):
         """Async context manager exit."""
         if self._engine:
             await self._engine.dispose()
+
+    @staticmethod
+    def _normalize_index(index: int, length: int) -> Optional[int]:
+        """Convert Python-style negative index to non-negative index."""
+        if length <= 0:
+            return None
+        if index < 0:
+            index = length + index
+        if 0 <= index < length:
+            return index
+        return None
+
+    @staticmethod
+    def _normalize_role_filter(role: Optional[str]) -> Optional[str]:
+        """Normalize optional role filter to core role names."""
+        if role is None:
+            return None
+        normalized = role.lower().strip()
+        if normalized in ("user", "person", "human"):
+            return "human"
+        if normalized in ("model", "bot", "agent", "assistant", "ai"):
+            return "ai"
+        if normalized in ("system", "sys", "instruction", "developer"):
+            return "system"
+        if normalized in ("tool", "function", "observation"):
+            return "tool"
+        return normalized

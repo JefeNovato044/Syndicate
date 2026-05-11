@@ -107,6 +107,7 @@ Syndicate is built for production reliability. Key resilience and observability 
 - **[Memory Rollback & Regeneration](docs/guides/memory-rollback.md)**
   - Soft vs Hard Deletion
   - Regenerating Agent responses
+    - Full history retrieval for UI and audit views
   - Backend support (Mongo, SQL, Local)
 
 - **Previous Hardening Notes**

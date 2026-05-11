@@ -664,6 +664,34 @@ class BaseAgent(ABC):
             return await self.memory.get_history(owner_id=owner_id, chat_id=chat_id)
         return []
 
+    async def get_full_history(
+        self,
+        owner_id: str = None,
+        chat_id: str = None,
+        limit: Optional[int] = None,
+        include_closed_buckets: bool = True,
+        include_deleted: bool = False,
+        include_context_summary: bool = False,
+    ) -> List[Message]:
+        """Get flattened conversation history for display or auditing."""
+        if hasattr(self.memory, 'get_full_history'):
+            return await self.memory.get_full_history(
+                owner_id=owner_id,
+                chat_id=chat_id,
+                limit=limit,
+                include_closed_buckets=include_closed_buckets,
+                include_deleted=include_deleted,
+                include_context_summary=include_context_summary,
+            )
+        if hasattr(self.memory, 'get_history'):
+            return await self.memory.get_history(
+                owner_id=owner_id,
+                chat_id=chat_id,
+                limit=limit,
+                include_context_summary=include_context_summary,
+            )
+        return []
+
     async def clear_history(self, owner_id: str = None, chat_id: str = None) -> None:
         """Clear conversation history."""
         if hasattr(self.memory, 'clear'):

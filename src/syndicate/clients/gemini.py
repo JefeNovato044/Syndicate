@@ -458,6 +458,12 @@ class GeminiClient(Client):
         if thinking_level:
             config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
         
+        # Forward any extra provider-specific kwargs (e.g. top_p, top_k, max_output_tokens)
+        _known_kwargs = {"temperature"}
+        for key, value in kwargs.items():
+            if key not in _known_kwargs:
+                config_kwargs[key] = value
+        
         config = types.GenerateContentConfig(**config_kwargs)
         
         # Generate response (async — native coroutine via google.genai.aio)
@@ -525,6 +531,12 @@ class GeminiClient(Client):
         
         if thinking_level:
             config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+        
+        # Forward any extra provider-specific kwargs (e.g. top_p, top_k, max_output_tokens)
+        _known_kwargs = {"temperature"}
+        for key, value in kwargs.items():
+            if key not in _known_kwargs:
+                config_kwargs[key] = value
         
         config = types.GenerateContentConfig(**config_kwargs)
         

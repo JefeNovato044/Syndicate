@@ -847,6 +847,40 @@ class LocalMemoryRollbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(deleted)
 
 
+class LocalMemoryFullHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_full_history_supports_closed_deleted_and_limit(self):
+        memory = LocalMemory(soft_delete=True)
+
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+        first_bucket = await memory.get_active_bucket("owner", "chat")
+        self.assertIsNotNone(first_bucket)
+        await memory.close_bucket(first_bucket.bucket_id)
+        await memory.create_bucket("owner", "chat", position=1)
+
+        await memory.add_message(Message(role="human", content="u2"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a2"), "owner", "chat")
+        await memory.delete_message("owner", "chat", index=-1)
+
+        history = await memory.get_full_history("owner", "chat")
+        self.assertEqual([m.content for m in history], ["u1", "a1", "u2"])
+
+        with_deleted = await memory.get_full_history("owner", "chat", include_deleted=True)
+        self.assertEqual([m.content for m in with_deleted], ["u1", "a1", "u2", "a2"])
+
+        active_only = await memory.get_full_history("owner", "chat", include_closed_buckets=False)
+        self.assertEqual([m.content for m in active_only], ["u2"])
+
+        limited = await memory.get_full_history(
+            "owner",
+            "chat",
+            include_deleted=True,
+            limit=2,
+        )
+        self.assertEqual([m.content for m in limited], ["u2", "a2"])
+
+
 class SqlitePostgresMemoryDeleteTests(unittest.IsolatedAsyncioTestCase):
     async def test_soft_delete_hides_message_from_history(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -869,6 +903,53 @@ class SqlitePostgresMemoryDeleteTests(unittest.IsolatedAsyncioTestCase):
                 active = await memory.get_active_bucket("owner", "chat")
                 self.assertIsNotNone(active)
                 self.assertEqual(len(active.messages), 2)
+            finally:
+                if memory._engine is not None:
+                    await memory._engine.dispose()
+
+
+class SqlitePostgresMemoryFullHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_full_history_supports_closed_deleted_and_limit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "full_history.db")
+            memory = SqlitePostgresMemory(
+                database_url=f"sqlite+aiosqlite:///{db_path}",
+                soft_delete=True,
+            )
+
+            try:
+                await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+                await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+                first_bucket = await memory.get_active_bucket("owner", "chat")
+                self.assertIsNotNone(first_bucket)
+                await memory.close_bucket(first_bucket.bucket_id)
+                await memory.create_bucket("owner", "chat", position=1)
+
+                await memory.add_message(Message(role="human", content="u2"), "owner", "chat")
+                await memory.add_message(Message(role="ai", content="a2"), "owner", "chat")
+                await memory.delete_message("owner", "chat", index=-1)
+
+                history = await memory.get_full_history("owner", "chat")
+                self.assertEqual([m.content for m in history], ["u1", "a1", "u2"])
+
+                with_deleted = await memory.get_full_history("owner", "chat", include_deleted=True)
+                self.assertEqual([m.content for m in with_deleted], ["u1", "a1", "u2", "a2"])
+
+                active_only = await memory.get_full_history(
+                    "owner",
+                    "chat",
+                    include_closed_buckets=False,
+                )
+                self.assertEqual([m.content for m in active_only], ["u2"])
+
+                limited = await memory.get_full_history(
+                    "owner",
+                    "chat",
+                    include_deleted=True,
+                    limit=2,
+                )
+                self.assertEqual([m.content for m in limited], ["u2", "a2"])
             finally:
                 if memory._engine is not None:
                     await memory._engine.dispose()
@@ -956,6 +1037,37 @@ class AgentRegenerateTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             await agent.regenerate_response(owner_id="owner", chat_id="chat")
+
+
+class AgentFullHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_get_full_history_delegates_to_memory(self):
+        memory = LocalMemory(soft_delete=True)
+
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+        first_bucket = await memory.get_active_bucket("owner", "chat")
+        self.assertIsNotNone(first_bucket)
+        await memory.close_bucket(first_bucket.bucket_id)
+        await memory.create_bucket("owner", "chat", position=1)
+
+        await memory.add_message(Message(role="human", content="u2"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        full_history = await agent.get_full_history(owner_id="owner", chat_id="chat")
+        self.assertEqual([m.content for m in full_history], ["u1", "a1", "u2"])
+
+        active_only = await agent.get_full_history(
+            owner_id="owner",
+            chat_id="chat",
+            include_closed_buckets=False,
+        )
+        self.assertEqual([m.content for m in active_only], ["u2"])
 
 
 class SqlitePostgresMemoryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -1052,6 +1164,55 @@ class _FakeMongoCollectionForDeleteFlow:
         if "messages" in payload:
             self.active_doc["messages"] = payload["messages"]
         return None
+
+
+class _FakeMongoAsyncIterCursor:
+    def __init__(self, docs):
+        self._docs = list(docs)
+        self._index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self._docs):
+            raise StopAsyncIteration
+        value = self._docs[self._index]
+        self._index += 1
+        return value
+
+
+class _FakeMongoCollectionForFullHistory:
+    def __init__(self, docs):
+        self.docs = list(docs)
+
+    def find(self, query, sort=None):
+        results = [
+            doc for doc in self.docs
+            if all(doc.get(key) == value for key, value in query.items())
+        ]
+
+        if sort:
+            field, direction = sort[0]
+            reverse = direction < 0
+            results.sort(key=lambda doc: doc.get(field, 0), reverse=reverse)
+
+        return _FakeMongoAsyncIterCursor(results)
+
+    async def find_one(self, query, sort=None):
+        results = [
+            doc for doc in self.docs
+            if all(doc.get(key) == value for key, value in query.items())
+        ]
+
+        if sort:
+            field, direction = sort[0]
+            reverse = direction < 0
+            results.sort(key=lambda doc: doc.get(field, 0), reverse=reverse)
+
+        if not results:
+            return None
+        return results[0]
 
 
 class MongoMemoryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -1175,6 +1336,84 @@ class MongoMemoryDeleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m.role for m in history], ["ai"])
         self.assertEqual(len(active_doc["messages"]), 1)
         self.assertEqual(active_doc["messages"][0]["role"], "ai")
+
+
+class MongoMemoryFullHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_full_history_supports_closed_deleted_and_limit(self):
+        docs = [
+            {
+                "bucket_id": "bucket-0",
+                "owner_id": "owner",
+                "chat_id": "chat",
+                "messages": [
+                    {
+                        "role": "human",
+                        "content": "u1",
+                        "timestamp": datetime.now(timezone.utc),
+                    },
+                    {
+                        "role": "ai",
+                        "content": "a1",
+                        "timestamp": datetime.now(timezone.utc),
+                    },
+                ],
+                "summary": None,
+                "is_active": False,
+                "position": 0,
+            },
+            {
+                "bucket_id": "bucket-1",
+                "owner_id": "owner",
+                "chat_id": "chat",
+                "messages": [
+                    {
+                        "role": "human",
+                        "content": "u2",
+                        "timestamp": datetime.now(timezone.utc),
+                    },
+                    {
+                        "role": "ai",
+                        "content": "a2",
+                        "timestamp": datetime.now(timezone.utc),
+                        "$deleted": True,
+                    },
+                ],
+                "summary": None,
+                "is_active": True,
+                "position": 1,
+            },
+        ]
+        fake_collection = _FakeMongoCollectionForFullHistory(docs)
+
+        memory = MongoMemory.__new__(MongoMemory)
+        memory._collection = fake_collection
+        memory._indexes_created = True
+
+        async def _noop_indexes():
+            return None
+
+        memory._ensure_indexes = _noop_indexes
+
+        history = await memory.get_full_history("owner", "chat")
+        self.assertEqual([m.content for m in history], ["u1", "a1", "u2"])
+
+        with_deleted = await memory.get_full_history("owner", "chat", include_deleted=True)
+        self.assertEqual([m.content for m in with_deleted], ["u1", "a1", "u2", "a2"])
+
+        active_only = await memory.get_full_history(
+            "owner",
+            "chat",
+            include_closed_buckets=False,
+        )
+        self.assertEqual([m.content for m in active_only], ["u2"])
+
+        limited = await memory.get_full_history(
+            "owner",
+            "chat",
+            include_deleted=True,
+            limit=2,
+        )
+        self.assertEqual([m.content for m in limited], ["u2", "a2"])
 
 
 class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):

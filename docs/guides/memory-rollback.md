@@ -85,6 +85,43 @@ new_response = await agent.regenerate_response(session_id="session_1")
 
 ---
 
+## Full History API
+
+For UI timelines, exports, or audits, use `get_full_history()`.
+
+```python
+# Full flattened history: closed buckets + active bucket
+messages = await agent.get_full_history(
+    owner_id="user123",
+    chat_id="chat456",
+)
+
+# Active bucket only
+active_messages = await agent.get_full_history(
+    owner_id="user123",
+    chat_id="chat456",
+    include_closed_buckets=False,
+)
+
+# Include soft-deleted messages for admin/audit views
+all_messages = await agent.get_full_history(
+    owner_id="user123",
+    chat_id="chat456",
+    include_deleted=True,
+)
+```
+
+### Parameters
+- `include_closed_buckets` (default `True`): include historical closed buckets.
+- `include_deleted` (default `False`): include messages marked with `$deleted`.
+- `limit` (optional): return only the most recent N messages.
+- `include_context_summary` (default `False`): prepend summary context when reading active-only history.
+
+### Caveat
+- If `preserve_closed_buckets=False`, closed bucket messages are physically cleared on close. In this mode, `get_full_history()` cannot reconstruct those old raw messages and only active-bucket messages remain available.
+
+---
+
 ## Backend Support
 
 The following memory backends fully support Rollback and Regeneration:

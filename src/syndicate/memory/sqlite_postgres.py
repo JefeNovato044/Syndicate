@@ -384,6 +384,62 @@ class SqlitePostgresMemory(BaseChatMemory):
         messages.extend(visible_messages)
         return messages
 
+    async def get_full_history(
+        self,
+        owner_id: str,
+        chat_id: str,
+        limit: Optional[int] = None,
+        include_closed_buckets: bool = True,
+        include_deleted: bool = False,
+        include_context_summary: bool = False,
+    ) -> List[Message]:
+        """Get flattened history for a conversation across bucket boundaries."""
+        await self._ensure_tables()
+
+        context_message: Optional[Message] = None
+        if include_context_summary and not include_closed_buckets:
+            context = await self.get_context_summary(owner_id, chat_id)
+            if context:
+                context_message = Message(
+                    role="system",
+                    content=f"Previous conversation context:\n{context}",
+                )
+
+        messages: List[Message] = []
+        async with self._get_session() as session:
+            M = self._bucket_model
+            if include_closed_buckets:
+                result = await session.execute(
+                    select(M.messages).where(
+                        M.owner_id == owner_id,
+                        M.chat_id == chat_id,
+                    ).order_by(M.position.asc())
+                )
+                raw_rows = result.all()
+            else:
+                result = await session.execute(
+                    select(M.messages).where(
+                        M.owner_id == owner_id,
+                        M.chat_id == chat_id,
+                        M.is_active.is_(True),
+                    ).order_by(M.position.desc()).limit(1)
+                )
+                raw_rows = result.all()
+
+        for row in raw_rows:
+            raw_messages = json.loads(row.messages or "[]")
+            for raw in raw_messages:
+                if not include_deleted and raw.get("$deleted", False):
+                    continue
+                messages.append(self._dict_to_message(raw))
+
+        if limit is not None:
+            messages = messages[-limit:]
+
+        if context_message is not None:
+            return [context_message] + messages
+        return messages
+
     async def clear(self, owner_id: str, chat_id: str) -> None:
         """
         Clear all messages and buckets for a specific conversation.

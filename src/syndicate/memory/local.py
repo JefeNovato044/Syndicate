@@ -150,6 +150,50 @@ class LocalMemory(BaseChatMemory):
         
         return messages
 
+    async def get_full_history(
+        self,
+        owner_id: str,
+        chat_id: str,
+        limit: Optional[int] = None,
+        include_closed_buckets: bool = True,
+        include_deleted: bool = False,
+        include_context_summary: bool = False,
+    ) -> List[Message]:
+        """Get flattened history from closed buckets + active bucket."""
+        key = (owner_id, chat_id)
+        selected_buckets: List[MessageBucket] = []
+
+        if include_closed_buckets:
+            closed = sorted(
+                self._closed_buckets.get(key, []),
+                key=lambda b: b.position,
+            )
+            selected_buckets.extend(closed)
+
+        active = self._buckets.get(key)
+        if active is not None and active.is_active:
+            selected_buckets.append(active)
+
+        deleted_ids = self._deleted_message_ids.get(key, set())
+        messages: List[Message] = []
+        for bucket in selected_buckets:
+            for message in bucket.messages:
+                if not include_deleted and self._message_id(message) in deleted_ids:
+                    continue
+                messages.append(message)
+
+        if limit is not None:
+            messages = messages[-limit:]
+
+        if include_context_summary and not include_closed_buckets:
+            context = await self.get_context_summary(owner_id, chat_id)
+            if context:
+                messages = [
+                    Message(role="system", content=f"Previous conversation context:\n{context}")
+                ] + messages
+
+        return messages
+
     async def clear(self, owner_id: str, chat_id: str) -> None:
         """
         Clear all messages and buckets for a specific conversation.

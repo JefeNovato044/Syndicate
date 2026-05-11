@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any
 from .summarizers import Summarizer
 from ..communication_models import MessageBucket, Message
 
@@ -134,6 +134,42 @@ class BaseChatMemory(ABC):
             List of Messages in chronological order
         """
         pass
+
+    async def get_full_history(
+        self,
+        owner_id: str,
+        chat_id: str,
+        limit: Optional[int] = None,
+        include_closed_buckets: bool = True,
+        include_deleted: bool = False,
+        include_context_summary: bool = False,
+    ) -> List[Message]:
+        """Get flattened history for display and auditing use cases.
+
+        Default behavior is a safe fallback to ``get_history()`` so custom
+        backends that haven't implemented full-history retrieval keep working.
+        Built-in persistent backends override this to include closed buckets.
+
+        Args:
+            owner_id: User/owner identifier.
+            chat_id: Conversation/session identifier.
+            limit: Optional maximum number of messages to return.
+            include_closed_buckets: Include closed buckets when backend supports
+                bucket history traversal.
+            include_deleted: Include soft-deleted messages when supported.
+            include_context_summary: Optionally prepend context summary message.
+
+        Returns:
+            List of Messages in chronological order.
+        """
+        _ = include_closed_buckets
+        _ = include_deleted
+        return await self.get_history(
+            owner_id=owner_id,
+            chat_id=chat_id,
+            limit=limit,
+            include_context_summary=include_context_summary,
+        )
     
     @abstractmethod
     async def clear(self, owner_id: str, chat_id: str) -> None:
@@ -460,8 +496,30 @@ class BaseChatMemory(ABC):
             chat_id: Conversation/session identifier
             provider: Optional provider hint ('gemini', 'openai', 'anthropic')
         """
-        from .parsers import MessageParser
-        parsed = MessageParser.parse_message(message, provider)
+        if isinstance(message, Message):
+            parsed = message
+        elif isinstance(message, dict):
+            parsed = Message.model_validate(message)
+        elif hasattr(message, "model_dump") and callable(message.model_dump):
+            parsed = Message.model_validate(message.model_dump())
+        elif hasattr(message, "role") and hasattr(message, "content"):
+            payload = {
+                "role": getattr(message, "role"),
+                "content": getattr(message, "content"),
+                "timestamp": getattr(message, "timestamp", None),
+                "tool_calls": getattr(message, "tool_calls", None),
+                "thinking": getattr(message, "thinking", None),
+                "thinking_tokens": getattr(message, "thinking_tokens", None),
+                "tool_call_id": getattr(message, "tool_call_id", None),
+            }
+            parsed = Message.model_validate({k: v for k, v in payload.items() if v is not None})
+        else:
+            provider_hint = f" provider={provider!r}" if provider is not None else ""
+            raise ValueError(
+                "Unsupported message format for add_message_from_provider: "
+                f"{type(message).__name__}.{provider_hint}"
+            )
+
         await self.add_message(parsed, owner_id, chat_id)
 
 

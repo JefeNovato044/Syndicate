@@ -133,21 +133,88 @@ class _FakeRegenerateClient:
 
 
 class _FakeEmbeddingModel:
-    def __init__(self, query_embedding=None, batch_embeddings=None):
+    def __init__(
+        self,
+        query_embedding=None,
+        batch_embeddings=None,
+        default_dimension=2,
+        supports_dimension_override=True,
+        supported_modes=None,
+    ):
         self.query_embedding = query_embedding or [0.1, 0.2]
         self.batch_embeddings = batch_embeddings
+        self.default_dimension = default_dimension
+        self.supports_dimension_override = supports_dimension_override
+        self.supported_modes = set(supported_modes or {"query", "document"})
+        self._effective_dimension = default_dimension
+        self.dimension_source = "default"
+        self.closed = False
         self.embed_calls = []
         self.embed_batch_calls = []
 
-    async def embed(self, text):
+    @property
+    def model_name(self):
+        return "fake-embedding-model"
+
+    @property
+    def embedding_dimension(self):
+        return self._effective_dimension
+
+    @property
+    def embedding_space_id(self):
+        return f"fake:{self.model_name}:dim={self.embedding_dimension}"
+
+    def get_model_info(self):
+        return {
+            "provider": "fake",
+            "model_name": self.model_name,
+            "default_dimension": self.default_dimension,
+            "effective_dimension": self.embedding_dimension,
+            "supports_dimension_override": self.supports_dimension_override,
+            "dimension_source": self.dimension_source,
+            "embedding_space_id": self.embedding_space_id,
+        }
+
+    def get_capabilities(self):
+        return {
+            "supported_modes": sorted(self.supported_modes),
+            "supports_batching": True,
+            "supports_dimension_override": self.supports_dimension_override,
+            "max_batch_size": None,
+            "max_input_tokens": None,
+        }
+
+    def supports_mode(self, mode):
+        mode_value = getattr(mode, "value", str(mode)).lower()
+        return mode_value in self.supported_modes
+
+    def configure_dimension(self, dims, source="explicit"):
+        if dims <= 0:
+            raise ValueError("dims must be a positive integer")
+        if not self.supports_dimension_override and dims != self.default_dimension:
+            raise ValueError(
+                f"Model {self.model_name} has fixed dimension {self.default_dimension}; "
+                f"cannot configure {dims}."
+            )
+
+        self._effective_dimension = dims
+        self.dimension_source = source
+
+    async def embed(self, text, mode="document"):
         self.embed_calls.append(text)
         return self.query_embedding
 
-    async def embed_batch(self, texts):
+    async def embed_batch(self, texts, mode="document"):
         self.embed_batch_calls.append(list(texts))
         if self.batch_embeddings is not None:
             return self.batch_embeddings
-        return [[float(i)] for i in range(len(texts))]
+        return [
+            [float(i + idx) for idx in range(self.embedding_dimension)]
+            for i in range(len(texts))
+        ]
+
+    async def close(self):
+        self.closed = True
 
 
 class _FakeAsyncCursor:
@@ -161,15 +228,29 @@ class _FakeAsyncCursor:
 
 
 class _FakeMongoCollectionForVectorStore:
-    def __init__(self, *, aggregate_results=None, aggregate_error=None, find_results=None, delete_count=0):
+    def __init__(
+        self,
+        *,
+        aggregate_results=None,
+        aggregate_error=None,
+        find_results=None,
+        delete_count=0,
+        search_indexes=None,
+        search_index_api_available=True,
+        create_search_index_error=None,
+    ):
         self.aggregate_results = aggregate_results if aggregate_results is not None else []
         self.aggregate_error = aggregate_error
         self.find_results = find_results if find_results is not None else []
         self.delete_count = delete_count
+        self.search_indexes = list(search_indexes or [])
+        self.search_index_api_available = search_index_api_available
+        self.create_search_index_error = create_search_index_error
         self.aggregate_pipelines = []
         self.insert_many_calls = []
         self.delete_queries = []
         self.find_queries = []
+        self.created_search_index_models = []
 
     def aggregate(self, pipeline):
         self.aggregate_pipelines.append(pipeline)
@@ -187,6 +268,44 @@ class _FakeMongoCollectionForVectorStore:
     def find(self, query):
         self.find_queries.append(query)
         return _FakeAsyncCursor(self.find_results)
+
+    def list_search_indexes(self):
+        if not self.search_index_api_available:
+            raise AttributeError("list_search_indexes unavailable")
+        return _FakeAsyncCursor(self.search_indexes)
+
+    async def create_search_index(self, model=None):
+        if not self.search_index_api_available:
+            raise AttributeError("create_search_index unavailable")
+        if self.create_search_index_error is not None:
+            raise self.create_search_index_error
+
+        self.created_search_index_models.append(model)
+
+        document = getattr(model, "document", None)
+        if isinstance(document, dict):
+            name = document.get("name")
+            definition = document.get("definition") or {}
+        else:
+            name = getattr(model, "name", None)
+            definition = getattr(model, "definition", {})
+
+        if not isinstance(name, str) or not name:
+            name = f"search-index-{len(self.created_search_index_models)}"
+
+        self.search_indexes.append(
+            {
+                "name": name,
+                "definition": definition if isinstance(definition, dict) else {},
+            }
+        )
+        return name
+
+    async def create_search_indexes(self, models):
+        created = []
+        for model in models:
+            created.append(await self.create_search_index(model=model))
+        return created
 
 
 class DelegationIsolationTests(unittest.IsolatedAsyncioTestCase):
@@ -1424,9 +1543,53 @@ class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):
             database="test_db",
             collection="test_collection",
             embedding_model=model,
-            vector_dimension=2,
+            dims=2,
         )
         return store, model
+
+    def test_constructor_warns_when_store_dims_override_model_dims(self):
+        model = _FakeEmbeddingModel(default_dimension=2, supports_dimension_override=True)
+
+        with self.assertWarns(RuntimeWarning):
+            store = MongoVectorStore(
+                connection_string="mongodb+srv://user:pass@cluster.mongodb.net/",
+                database="test_db",
+                collection="test_collection",
+                embedding_model=model,
+                dims=3,
+            )
+
+        self.assertEqual(store.effective_dimension, 3)
+        self.assertEqual(model.embedding_dimension, 3)
+        self.assertEqual(store.dimension_source, "vector_store")
+
+    def test_constructor_fails_on_fixed_dimension_mismatch(self):
+        model = _FakeEmbeddingModel(default_dimension=2, supports_dimension_override=False)
+
+        with self.assertRaises(ValueError) as ctx:
+            MongoVectorStore(
+                connection_string="mongodb+srv://user:pass@cluster.mongodb.net/",
+                database="test_db",
+                collection="test_collection",
+                embedding_model=model,
+                dims=3,
+            )
+
+        self.assertIn("fixed dimension", str(ctx.exception))
+
+    def test_constructor_requires_query_and_document_modes(self):
+        model = _FakeEmbeddingModel(supported_modes={"document"})
+
+        with self.assertRaises(ValueError) as ctx:
+            MongoVectorStore(
+                connection_string="mongodb+srv://user:pass@cluster.mongodb.net/",
+                database="test_db",
+                collection="test_collection",
+                embedding_model=model,
+                dims=2,
+            )
+
+        self.assertIn("missing required modes", str(ctx.exception))
 
     async def test_search_defaults_to_hybrid_and_embeds_query(self):
         store, model = self._build_store()
@@ -1453,6 +1616,16 @@ class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.embed_calls, ["vacation days"])
         store._vector_search.assert_awaited_once_with([0.1, 0.2], 2, None)
         store._hybrid_search.assert_not_awaited()
+
+    async def test_search_rejects_query_dimension_mismatch(self):
+        model = _FakeEmbeddingModel(query_embedding=[0.1])
+        store, _ = self._build_store(embedding_model=model)
+        store._collection = object()
+
+        with self.assertRaises(ValueError) as ctx:
+            await store.search("benefits policy")
+
+        self.assertIn("Query embedding dimension mismatch", str(ctx.exception))
 
     async def test_vector_search_builds_pipeline_with_prefilter(self):
         fake_collection = _FakeMongoCollectionForVectorStore(
@@ -1555,6 +1728,69 @@ class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_collection.delete_queries[1], {})
         self.assertEqual(deleted_selected, 2)
         self.assertEqual(deleted_all, 2)
+
+    async def test_add_texts_rejects_document_dimension_mismatch(self):
+        model = _FakeEmbeddingModel(batch_embeddings=[[0.01], [0.02]])
+        fake_collection = _FakeMongoCollectionForVectorStore()
+        store, _ = self._build_store(embedding_model=model)
+        store._collection = fake_collection
+
+        with self.assertRaises(ValueError) as ctx:
+            await store.add_texts(texts=["Doc 1", "Doc 2"])
+
+        self.assertIn("Document embedding dimension mismatch", str(ctx.exception))
+
+    async def test_close_chains_embedding_model_close(self):
+        class _FakeClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        store, model = self._build_store()
+        fake_client = _FakeClient()
+        store._client = fake_client
+
+        await store.close()
+        await store.close()  # idempotent/safe repeated close
+
+        self.assertTrue(fake_client.closed)
+        self.assertTrue(model.closed)
+
+    async def test_backend_bootstrap_creates_indexes_once_and_is_idempotent(self):
+        fake_collection = _FakeMongoCollectionForVectorStore(search_indexes=[])
+        store, _ = self._build_store()
+        store._collection = fake_collection
+
+        await store.ensure_backend_ready(create_indexes=True)
+        await store.ensure_backend_ready(create_indexes=True)
+
+        self.assertEqual(len(fake_collection.created_search_index_models), 2)
+        self.assertTrue(store._search_indexes_ready)
+
+    async def test_backend_bootstrap_reports_manual_setup_when_index_api_unavailable(self):
+        fake_collection = _FakeMongoCollectionForVectorStore(search_index_api_available=False)
+        store, _ = self._build_store()
+        store._collection = fake_collection
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await store.ensure_backend_ready(create_indexes=True)
+
+        self.assertIn("manually in Atlas UI/CLI", str(ctx.exception))
+
+    async def test_backend_bootstrap_reports_manual_setup_on_permission_failure(self):
+        fake_collection = _FakeMongoCollectionForVectorStore(
+            search_indexes=[],
+            create_search_index_error=OperationFailure("not authorized"),
+        )
+        store, _ = self._build_store()
+        store._collection = fake_collection
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await store.ensure_backend_ready(create_indexes=True)
+
+        self.assertIn("manually in Atlas UI/CLI", str(ctx.exception))
 
 
 class KnowledgeBaseSkillCustomizationTests(unittest.TestCase):

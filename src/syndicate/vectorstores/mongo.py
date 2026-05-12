@@ -9,7 +9,7 @@ MongoDB) because it uses the $vectorSearch and $search aggregation stages
 which are Atlas-only features.
 
 Requirements:
-    - pymongo>=4.6.0 (for AsyncMongoClient)
+    - pymongo>=4.16.0 (for AsyncMongoClient and Atlas search index APIs)
     - MongoDB Atlas cluster with vector search enabled
 
 Example:
@@ -26,7 +26,7 @@ Example:
         database="mydb",
         collection="vectors",
         embedding_model=embedding_model,
-        vector_dimension=384
+        dims=384
     )
     
     # Add documents
@@ -41,10 +41,11 @@ from typing import Any, Dict, List, Optional
 import logging
 
 from pymongo import AsyncMongoClient
-from pymongo.errors import OperationFailure, ConfigurationError
+from pymongo.errors import CollectionInvalid, OperationFailure
+from pymongo.operations import SearchIndexModel
 
 from .base import BaseVectorStore
-from ..ingestion.embedding_models import EmbeddingModel
+from ..ingestion.embedding_models import EmbeddingModel, EmbeddingMode
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +108,10 @@ class MongoVectorStore(BaseVectorStore):
         database: str,
         collection: str,
         embedding_model: EmbeddingModel,
-        vector_dimension: int,
+        dims: Optional[int] = None,
         index_name: str = "vector_index",
-        search_index_name: str = "text_index"
+        search_index_name: str = "text_index",
+        auto_setup: bool = False,
     ):
         """
         Args:
@@ -118,21 +120,32 @@ class MongoVectorStore(BaseVectorStore):
             database: Database name
             collection: Collection name for storing vectors
             embedding_model: Embedding model for generating vectors
-            vector_dimension: Dimension of embedding vectors (must match model)
+            dims: Optional vector dimension override. If None, uses the
+                  embedding model effective dimension.
             index_name: Name of the vector search index in Atlas
             search_index_name: Name of the Atlas Search index for keyword search
+            auto_setup: If True, automatically attempts backend provisioning
+                        (collection + required search indexes) before reads/writes.
         """
         super().__init__(embedding_model=embedding_model)
         
         self.connection_string = connection_string
         self.database = database
         self.collection = collection
-        self.vector_dimension = vector_dimension
         self.index_name = index_name
         self.search_index_name = search_index_name
+        self.auto_setup = auto_setup
+        self.requested_dimension = dims
         
         self._client: Optional[AsyncMongoClient] = None
         self._collection = None
+        self._collection_ready = False
+        self._search_indexes_ready = False
+        self._backend_validated = False
+        self.model_info: Dict[str, Any] = {}
+
+        self._resolve_effective_dimension(dims)
+        self.model_info = self.embedding_model.get_model_info()
     
     def _get_client(self) -> AsyncMongoClient:
         """Get or create MongoDB client.
@@ -159,6 +172,230 @@ class MongoVectorStore(BaseVectorStore):
             db = client[self.database]
             self._collection = db[self.collection]
         return self._collection
+
+    async def ensure_backend_ready(self, create_indexes: bool = False) -> None:
+        """Ensure backend resources exist.
+
+        This method is idempotent and safe to call multiple times.
+        """
+        await self._ensure_collection_exists()
+        if create_indexes:
+            await self._ensure_required_search_indexes()
+
+        if not self._backend_validated:
+            await self.validate_backend_configuration()
+            self._backend_validated = True
+
+    async def _ensure_collection_exists(self) -> None:
+        """Ensure target collection exists (best effort, idempotent)."""
+        if self._collection_ready:
+            return
+
+        if self._collection is not None:
+            self._collection_ready = True
+            return
+
+        client = self._get_client()
+        database = client[self.database]
+        try:
+            existing_collections = await database.list_collection_names()
+            if self.collection not in existing_collections:
+                await database.create_collection(self.collection)
+                logger.info(
+                    "Created Mongo collection %s.%s",
+                    self.database,
+                    self.collection,
+                )
+            else:
+                logger.info(
+                    "Mongo collection already exists: %s.%s",
+                    self.database,
+                    self.collection,
+                )
+        except CollectionInvalid:
+            logger.info(
+                "Mongo collection already exists (race): %s.%s",
+                self.database,
+                self.collection,
+            )
+
+        self._collection = database[self.collection]
+        self._collection_ready = True
+
+    async def _ensure_required_search_indexes(self) -> None:
+        """Ensure Atlas vector/text search indexes exist (idempotent)."""
+        if self._search_indexes_ready:
+            return
+
+        collection = self._get_collection()
+        try:
+            existing_search_indexes = await self._list_existing_search_indexes(collection)
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to inspect Atlas search indexes automatically. "
+                "Create required indexes manually in Atlas UI/CLI."
+            ) from exc
+
+        missing_models: List[SearchIndexModel] = []
+        if self.index_name not in existing_search_indexes:
+            missing_models.append(self._build_vector_search_index_model())
+        if self.search_index_name not in existing_search_indexes:
+            missing_models.append(self._build_text_search_index_model())
+
+        if not missing_models:
+            logger.info(
+                "Required Atlas search indexes already exist: %s, %s",
+                self.index_name,
+                self.search_index_name,
+            )
+            self._search_indexes_ready = True
+            return
+
+        create_many = getattr(collection, "create_search_indexes", None)
+        create_one = getattr(collection, "create_search_index", None)
+
+        try:
+            if callable(create_many):
+                try:
+                    await create_many(missing_models)
+                except TypeError:
+                    await create_many(models=missing_models)
+            elif callable(create_one):
+                for model in missing_models:
+                    try:
+                        await create_one(model=model)
+                    except TypeError:
+                        await create_one(model)
+            else:
+                raise RuntimeError(
+                    "Atlas Search index creation API is unavailable in this environment. "
+                    "Create search indexes manually in Atlas UI/CLI."
+                )
+        except OperationFailure as exc:
+            raise RuntimeError(
+                "Atlas rejected automatic index creation (permission/API limitation). "
+                "Create required indexes manually in Atlas UI/CLI."
+            ) from exc
+
+        created_names = [
+            getattr(model, "name", None) or f"index_{idx}"
+            for idx, model in enumerate(missing_models, start=1)
+        ]
+        logger.info("Created Atlas search indexes: %s", created_names)
+        self._search_indexes_ready = True
+
+    async def _list_existing_search_indexes(self, collection) -> set[str]:
+        """List existing Atlas Search indexes by name."""
+        list_indexes = getattr(collection, "list_search_indexes", None)
+        if not callable(list_indexes):
+            raise RuntimeError(
+                "Atlas Search index listing API is unavailable in this environment. "
+                "Create search indexes manually in Atlas UI/CLI."
+            )
+
+        cursor = list_indexes()
+        documents = await cursor.to_list(length=None)
+        names: set[str] = set()
+        for document in documents:
+            if isinstance(document, dict):
+                name = document.get("name")
+                if isinstance(name, str) and name:
+                    names.add(name)
+        return names
+
+    def _build_vector_search_index_model(self) -> SearchIndexModel:
+        """Build Atlas vector search index definition."""
+        return SearchIndexModel(
+            name=self.index_name,
+            type="vectorSearch",
+            definition={
+                "fields": [
+                    {
+                        "numDimensions": self.effective_dimension,
+                        "path": "embedding",
+                        "similarity": "cosine",
+                        "type": "vector",
+                    }
+                ]
+            },
+        )
+
+    def _build_text_search_index_model(self) -> SearchIndexModel:
+        """Build Atlas full-text search index definition."""
+        return SearchIndexModel(
+            name=self.search_index_name,
+            type="search",
+            definition={
+                "mappings": {
+                    "dynamic": False,
+                    "fields": {
+                        "text": {
+                            "type": "string",
+                        }
+                    },
+                }
+            },
+        )
+
+    async def validate_backend_configuration(self) -> None:
+        """Best-effort backend/index validation.
+
+        Validates vector index dimension when Atlas metadata is available.
+        """
+        collection = self._get_collection()
+        list_indexes = getattr(collection, "list_search_indexes", None)
+        if not callable(list_indexes):
+            logger.info(
+                "Skipping Atlas index validation because list_search_indexes is unavailable."
+            )
+            return
+
+        cursor = list_indexes()
+        documents = await cursor.to_list(length=None)
+        vector_index = None
+        for document in documents:
+            if isinstance(document, dict) and document.get("name") == self.index_name:
+                vector_index = document
+                break
+
+        if vector_index is None:
+            logger.info("Vector search index %s not found during validation", self.index_name)
+            return
+
+        definition = vector_index.get("latestDefinition") or vector_index.get("definition") or {}
+        index_dims = self._extract_vector_index_dimensions(definition)
+        if index_dims is None:
+            logger.info(
+                "Could not extract numDimensions from index %s during validation",
+                self.index_name,
+            )
+            return
+
+        if int(index_dims) != int(self.effective_dimension):
+            raise ValueError(
+                "Atlas vector index dimension mismatch: "
+                f"index '{self.index_name}' has {index_dims}, "
+                f"store effective dimension is {self.effective_dimension}."
+            )
+
+    def _extract_vector_index_dimensions(self, definition: Dict[str, Any]) -> Optional[int]:
+        """Extract vector index numDimensions from Atlas index definition."""
+        fields = definition.get("fields")
+        if not isinstance(fields, list):
+            return None
+
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            if field.get("type") != "vector":
+                continue
+            if field.get("path") != "embedding":
+                continue
+            dims = field.get("numDimensions")
+            if isinstance(dims, int):
+                return dims
+
+        return None
     
     async def search(
         self,
@@ -168,7 +405,10 @@ class MongoVectorStore(BaseVectorStore):
         use_hybrid: bool = True
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar documents using vector, keyword, or hybrid search.
+        Search for similar documents using vector-only or hybrid search.
+
+        Hybrid mode internally combines vector similarity and Atlas keyword/full-text
+        results using RRF.
         
         Args:
             query: Search query text
@@ -188,10 +428,15 @@ class MongoVectorStore(BaseVectorStore):
                 ...
             ]
         """
-        collection = self._get_collection()
-        
+        if self.auto_setup:
+            await self.ensure_backend_ready(create_indexes=True)
+
         # Embed the query
-        query_embedding = await self.embedding_model.embed(query)
+        query_embedding = await self.embedding_model.embed(
+            query,
+            mode=EmbeddingMode.QUERY.value,
+        )
+        self._validate_query_embedding(query_embedding)
         
         if use_hybrid:
             # Perform hybrid search with RRF
@@ -218,6 +463,7 @@ class MongoVectorStore(BaseVectorStore):
         Returns:
             List of result dictionaries
         """
+        self._validate_query_embedding(query_embedding)
         collection = self._get_collection()
         
         # Build filter pipeline
@@ -392,6 +638,9 @@ class MongoVectorStore(BaseVectorStore):
         Returns:
             List of document IDs
         """
+        if self.auto_setup:
+            await self.ensure_backend_ready(create_indexes=True)
+
         # Validate inputs
         self._validate_inputs(texts, metadatas, ids)
         
@@ -400,7 +649,11 @@ class MongoVectorStore(BaseVectorStore):
             ids = self._generate_ids(len(texts))
         
         # Generate embeddings for all texts
-        embeddings = await self.embedding_model.embed_batch(texts)
+        embeddings = await self.embedding_model.embed_batch(
+            texts,
+            mode=EmbeddingMode.DOCUMENT.value,
+        )
+        self._validate_document_embeddings(embeddings)
         
         # Prepare documents
         documents = []
@@ -500,13 +753,25 @@ class MongoVectorStore(BaseVectorStore):
         return formatted
     
     async def close(self):
-        """Close the MongoDB connection."""
+        """Close MongoDB and embedding model resources."""
         if self._client is not None:
             self._client.close()
             self._client = None
             self._collection = None
+            self._collection_ready = False
+            self._search_indexes_ready = False
+            self._backend_validated = False
+
+        try:
+            await self.embedding_model.close()
+        except Exception as exc:
+            logger.warning("Error while closing embedding model: %s", exc)
     
     def __del__(self):
-        """Ensure connection is closed on deletion."""
-        if self._client is not None:
-            self._client.close()
+        """Ensure connection cleanup on object deletion (best effort)."""
+        try:
+            if self._client is not None:
+                self._client.close()
+        except Exception:
+            # Never raise from finalizer.
+            pass

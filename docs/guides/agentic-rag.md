@@ -26,7 +26,7 @@ pip install "syndicate[rag,embeddings-openai]"
 ## Core Components
 
 - **Vector Store** (e.g., `MongoVectorStore`): Stores document chunks and handles hybrid/semantic search.
-- **Embedding Model** (e.g., `SentenceTransformerEmbedding`): Converts text into vector embeddings.
+- **Embedding Model** (e.g., `SentenceTransformerEmbedding`): Converts text into vector embeddings with mode-aware generation (`document` for ingestion, `query` for retrieval).
 - **Tools & Skills**: `RAGSearchTool` enables raw search, while `KnowledgeBaseSkill` bundles the tool with LLM behavioral instructions.
 
 ---
@@ -54,12 +54,39 @@ async def setup_store():
         database="syndicate_demo",
         collection="knowledge_base",
         embedding_model=embedding_model,
-        vector_dimension=384,
+        # Optional explicit override. Omit `dims` to use model defaults.
+        dims=384,
         index_name="vector_index",
         search_index_name="text_index"
     )
+
+    # Optional: provision collection/indexes through Mongo API when available.
+    # If Atlas API/permissions do not allow it, set up indexes manually in Atlas.
+    await vector_store.ensure_backend_ready(create_indexes=True)
     
     return vector_store
+```
+
+### 1.1 Dimension and Embedding Mode Contract
+
+- `MongoVectorStore` automatically uses `document` embeddings during `add_texts()` and `query` embeddings during `search()`.
+- If `dims` is omitted, the store uses the embedding model's effective dimension.
+- If `dims` is provided and the model has fixed output dimensions, mismatches fail fast with `ValueError`.
+- If `dims` is provided and the model supports dimension override, Syndicate reconfigures the model and emits a warning so the override is visible.
+
+### 1.2 Backend Bootstrap Options
+
+You can choose either eager startup provisioning or lazy auto-setup:
+
+```python
+# Option A (recommended): provision/validate once during startup
+await vector_store.ensure_backend_ready(create_indexes=True)
+
+# Option B: defer provisioning checks until reads/writes
+vector_store = MongoVectorStore(
+    ...,
+    auto_setup=True,
+)
 ```
 
 ### 2. Ingesting Documents

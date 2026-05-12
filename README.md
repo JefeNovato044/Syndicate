@@ -115,6 +115,16 @@ Syndicate is built for production reliability. Key resilience and observability 
   - Single-active-bucket guarantees in persistent memory
   - OpenAI tool argument parsing hardening
 
+## RAG Guides
+
+- **[Agentic RAG Tutorial](docs/guides/agentic-rag.md)**
+    - End-to-end setup with `MongoVectorStore`, `KnowledgeBaseSkill`, and ingestion utilities.
+    - Covers the current vector dimension contract (`dims`) and backend bootstrap (`ensure_backend_ready`).
+
+- **[RAGSearchTool Deep Guide](docs/guides/rag_tool_guide.md)**
+    - Direct `RAGSearchTool` usage, subclassing extension points, and formatting customization.
+    - Includes current readiness patterns (`ensure_backend_ready` and `auto_setup`).
+
 ### Component Layers
 
 | Layer | Purpose | Examples |

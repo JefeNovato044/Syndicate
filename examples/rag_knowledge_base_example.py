@@ -60,10 +60,14 @@ async def setup_vector_store():
         database="syndicate_demo",
         collection="knowledge_base",
         embedding_model=embedding_model,
-        vector_dimension=384,
+        dims=384,
         index_name="vector_index",
         search_index_name="text_index"
     )
+
+    # Optional bootstrap: if API/permissions allow, create collection and indexes.
+    # Otherwise set up Atlas indexes manually (developer responsibility).
+    await vector_store.ensure_backend_ready(create_indexes=True)
     
     print("Vector store initialized successfully!")
     return vector_store

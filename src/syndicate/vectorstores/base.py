@@ -11,10 +11,15 @@ retrieval, which is critical for accurate similarity search.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional, Sequence
 import uuid
+import warnings
 
-from ..ingestion.embedding_models import EmbeddingModel
+from ..ingestion.embedding_models import EmbeddingModel, EmbeddingMode
+
+
+logger = logging.getLogger(__name__)
 
 
 class BaseVectorStore(ABC):
@@ -64,6 +69,12 @@ class BaseVectorStore(ABC):
             raise ValueError("embedding_model is required")
         
         self.embedding_model = embedding_model
+        self.effective_dimension: Optional[int] = None
+        self.dimension_source: str = "unknown"
+        self.embedding_space_id: str = "unknown"
+        self.embedding_capabilities: Dict[str, Any] = {}
+        self._refresh_embedding_contract()
+        self._validate_required_modes()
     
     @abstractmethod
     async def search(
@@ -232,6 +243,101 @@ class BaseVectorStore(ABC):
         
         if ids is not None and len(ids) != len(set(ids)):
             raise ValueError("ids must be unique")
+
+    async def validate_backend_configuration(self) -> None:
+        """Best-effort backend configuration validation hook.
+
+        Concrete stores can override this to validate index configuration,
+        dimensions, or provider-specific readiness checks.
+        """
+
+    def _refresh_embedding_contract(self) -> None:
+        """Refresh cached embedding metadata and capabilities."""
+        model_info = self.embedding_model.get_model_info()
+        capabilities = self.embedding_model.get_capabilities()
+
+        self.effective_dimension = int(model_info["effective_dimension"])
+        self.dimension_source = str(model_info["dimension_source"])
+        self.embedding_space_id = str(model_info["embedding_space_id"])
+        self.embedding_capabilities = dict(capabilities)
+
+    def _resolve_effective_dimension(self, dims: Optional[int]) -> int:
+        """Resolve and enforce store effective dimension.
+
+        If dims is provided and differs from model effective dimension,
+        the embedding model is reconfigured only when override is supported.
+        """
+        self._refresh_embedding_contract()
+        model_effective_dimension = self.effective_dimension
+
+        if dims is None:
+            return int(model_effective_dimension)
+
+        if dims <= 0:
+            raise ValueError("dims must be a positive integer")
+
+        requested_dimension = int(dims)
+        if requested_dimension == model_effective_dimension:
+            return requested_dimension
+
+        if not self.embedding_model.supports_dimension_override:
+            raise ValueError(
+                "Store dims override requested but model has fixed dimension "
+                f"{model_effective_dimension}; cannot configure {requested_dimension}."
+            )
+
+        self.embedding_model.configure_dimension(requested_dimension, source="vector_store")
+        self._refresh_embedding_contract()
+        self._warn_dimension_override(
+            model_dims=model_effective_dimension,
+            store_dims=requested_dimension,
+            effective_dims=self.effective_dimension,
+        )
+        return int(self.effective_dimension)
+
+    def _validate_required_modes(self) -> None:
+        """Ensure query and document modes are available for core operations."""
+        required_modes = [EmbeddingMode.QUERY, EmbeddingMode.DOCUMENT]
+        missing = [mode.value for mode in required_modes if not self.embedding_model.supports_mode(mode)]
+        if missing:
+            raise ValueError(
+                f"Embedding model {self.embedding_model.model_name} is missing required modes: {missing}."
+            )
+
+    def _validate_query_embedding(self, vector: Sequence[float]) -> None:
+        """Validate query vector length against resolved store dimension."""
+        if self.effective_dimension is None:
+            raise ValueError("effective_dimension is not initialized")
+
+        actual = len(vector)
+        if actual != self.effective_dimension:
+            raise ValueError(
+                "Query embedding dimension mismatch: "
+                f"expected {self.effective_dimension}, got {actual}."
+            )
+
+    def _validate_document_embeddings(self, vectors: Sequence[Sequence[float]]) -> None:
+        """Validate all document embedding vector lengths."""
+        for idx, vector in enumerate(vectors):
+            try:
+                self._validate_query_embedding(vector)
+            except ValueError as exc:
+                raise ValueError(f"Document embedding dimension mismatch at index {idx}: {exc}") from exc
+
+    def _warn_dimension_override(
+        self,
+        model_dims: int,
+        store_dims: int,
+        effective_dims: int,
+    ) -> None:
+        """Emit warning and log when store configuration overrides model dims."""
+        message = (
+            "VectorStore dims override detected: store dims "
+            f"{store_dims} overrides model dims {model_dims}. "
+            f"Effective dims={effective_dims}."
+        )
+        logger.warning(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
 
 
 def reciprocal_rank_fusion(

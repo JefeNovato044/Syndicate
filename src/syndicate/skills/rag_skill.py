@@ -53,7 +53,7 @@ class KnowledgeBaseSkill(SkillModule):
             database="mydb",
             collection="vectors",
             embedding_model=embedding_model,
-            vector_dimension=384
+            dims=384
         )
         
         # Create and install skill

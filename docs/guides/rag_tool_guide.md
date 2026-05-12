@@ -1,6 +1,6 @@
 # RAGSearchTool Guide
 
-This guide covers how to use `RAGSearchTool` directly, bundle it with `KnowledgeBaseSkill`, and customize it via subclassing.
+This guide covers how to use `RAGSearchTool` directly, bundle it with `KnowledgeBaseSkill`, and customize it via subclassing. It also reflects the current vector store contract (`dims`, mode-aware embeddings, and backend readiness utilities).
 
 ---
 
@@ -9,11 +9,12 @@ This guide covers how to use `RAGSearchTool` directly, bundle it with `Knowledge
 1. [Overview](#overview)
 2. [Basic Usage: RAGSearchTool](#basic-usage-ragsearchtool)
 3. [Using KnowledgeBaseSkill](#using-knowledgebaseskill)
-4. [Filtering with `default_filter`](#filtering-with-default_filter)
-5. [Customizing Output with `format_results()`](#customizing-output-with-format_results)
-6. [Customizing Per-Result with `_format_single_result()`](#customizing-per-result-with-_format_single_result)
-7. [Building a Fully Custom RAG Tool](#building-a-fully-custom-rag-tool)
-8. [Migration: `get_result_text()` is Deprecated](#migration-get_result_text-is-deprecated)
+4. [Vector Store Readiness and Dimensions](#vector-store-readiness-and-dimensions)
+5. [Filtering with `default_filter`](#filtering-with-default_filter)
+6. [Customizing Output with `format_results()`](#customizing-output-with-format_results)
+7. [Customizing Per-Result with `_format_single_result()`](#customizing-per-result-with-_format_single_result)
+8. [Building a Fully Custom RAG Tool](#building-a-fully-custom-rag-tool)
+9. [Migration: `get_result_text()` is Deprecated](#migration-get_result_text-is-deprecated)
 
 ---
 
@@ -64,12 +65,39 @@ async def setup_vector_store():
         database="syndicate_demo",
         collection="knowledge_base",
         embedding_model=embedding_model,
-        vector_dimension=384,
+        # Optional explicit override. Omit `dims` to trust model defaults.
+        dims=384,
         index_name="vector_index",
         search_index_name="text_index"
     )
+
+    # Optional bootstrap: attempts collection/index creation via Mongo API.
+    # If unavailable, keep Atlas UI/CLI setup as developer responsibility.
+    await vector_store.ensure_backend_ready(create_indexes=True)
     
     return vector_store
+```
+
+## Vector Store Readiness and Dimensions
+
+`RAGSearchTool` inherits dimension and lifecycle behavior from the underlying vector store.
+
+- `MongoVectorStore` embeds documents in `document` mode and queries in `query` mode.
+- If `dims` is omitted, the store uses the embedding model's effective dimension.
+- If `dims` conflicts with a fixed-dimension model, initialization fails fast.
+- If your model supports dimension override, Syndicate reconfigures the model and emits a warning when store `dims` differs.
+
+### Readiness Patterns
+
+```python
+# Recommended: validate/provision once at startup
+await vector_store.ensure_backend_ready(create_indexes=True)
+
+# Alternative: lazy readiness checks on search/write calls
+vector_store = MongoVectorStore(
+    ...,
+    auto_setup=True,
+)
 ```
 
 ### Step 2: Create and Add the Tool
@@ -208,7 +236,7 @@ engineering_tool = RAGSearchTool(
 )
 ```
 
-When `default_filter` is set, every search automatically includes the filter. The filter is passed directly to `vector_store.search()` and applied at the database level (e.g., MongoDB query filter).
+When `default_filter` is set, every search automatically includes the filter. The filter is passed directly to `vector_store.search()` and interpreted by the selected backend.
 
 ### Combining with KnowledgeBaseSkill
 
@@ -217,28 +245,21 @@ When `default_filter` is set, every search automatically includes the filter. Th
 ```python
 class FilteredKnowledgeBaseSkill(KnowledgeBaseSkill):
     def __init__(self, vector_store, default_filter=None, **kwargs):
-        # Create search tool with filter
-        search_tool = RAGSearchTool(
-            vector_store=vector_store,
-            top_k=kwargs.get("top_k", 4),
-            use_hybrid=kwargs.get("use_hybrid", True),
-            default_filter=default_filter
-        )
-        
-        # Build expertise
-        domain = kwargs.get("domain", "knowledge base")
-        expertise = self._build_expertise(domain)
-        
-        # Initialize with custom tool
-        super().__init__(
-            vector_store=None,  # tool already created
-            top_k=kwargs.get("top_k", 4),
-            use_hybrid=kwargs.get("use_hybrid", True),
-            domain=domain,
-            **{k: v for k, v in kwargs.items() if k not in ("top_k", "use_hybrid", "domain")}
-        )
-        # Replace the default tool with our filtered one
-        self.tools = [search_tool]
+        top_k = kwargs.get("top_k", 4)
+        use_hybrid = kwargs.get("use_hybrid", True)
+
+        # Initialize standard skill first
+        super().__init__(vector_store=vector_store, **kwargs)
+
+        # Replace default tool with a filtered version
+        self.tools = [
+            RAGSearchTool(
+                vector_store=vector_store,
+                top_k=top_k,
+                use_hybrid=use_hybrid,
+                default_filter=default_filter,
+            )
+        ]
 ```
 
 ---
@@ -286,10 +307,11 @@ class CitationRAGSearchTool(RAGSearchTool):
         for i, r in enumerate(results):
             source = r.get("metadata", {}).get("source", "unknown")
             text = r.get("text", "")[:300]  # truncate long texts
-            score = r.get("score") or r.get("rrf_score", "?")
+            score = r.get("score") or r.get("rrf_score")
+            score_str = f"{score:.3f}" if isinstance(score, (int, float)) else "n/a"
             citations.append(
                 f"[{i+1}] {text}... "
-                f"(source: {source}, score: {score:.3f})"
+                f"(source: {source}, score: {score_str})"
             )
         
         return "\n".join(citations)
@@ -424,11 +446,12 @@ class MultiSourceRAGSearchTool(RAGSearchTool):
         for i, (source, docs) in enumerate(sources.items(), 1):
             parts.append(f"--- Source {i}: {source} ({len(docs)} results) ---")
             for j, doc in enumerate(docs, 1):
-                score = doc.get("score") or doc.get("rrf_score", "?")
+                score = doc.get("score") or doc.get("rrf_score")
+                score_str = f"{score:.3f}" if isinstance(score, (int, float)) else "n/a"
                 page = doc.get("metadata", {}).get("page")
                 page_str = f" (Page {page})" if page else ""
                 parts.append(
-                    f"  [{i}.{j}] Relevance: {score:.3f}{page_str}\n"
+                    f"  [{i}.{j}] Relevance: {score_str}{page_str}\n"
                     f"  {doc['text'][:500]}"
                 )
         
@@ -545,3 +568,4 @@ Override format_results() or _format_single_result() instead.
 | [`src/syndicate/vectorstores/base.py`](src/syndicate/vectorstores/base.py) | `BaseVectorStore` interface |
 | [`src/syndicate/vectorstores/mongo.py`](src/syndicate/vectorstores/mongo.py) | `MongoVectorStore` implementation |
 | [`examples/rag_knowledge_base_example.py`](examples/rag_knowledge_base_example.py) | Full usage examples |
+| [`docs/guides/agentic-rag.md`](docs/guides/agentic-rag.md) | End-to-end agentic RAG tutorial |

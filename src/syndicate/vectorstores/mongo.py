@@ -396,6 +396,38 @@ class MongoVectorStore(BaseVectorStore):
                 return dims
 
         return None
+
+    def _ensure_embedding_dimension_alignment(self) -> None:
+        """Ensure model runtime dimension remains aligned with store contract.
+
+        This guards against external/shared reconfiguration of the embedding
+        model after store initialization (for example, another component
+        reusing the same model instance with a different dimension).
+        """
+        if self.effective_dimension is None:
+            self._refresh_embedding_contract()
+
+        target_dimension = int(self.effective_dimension)
+        current_dimension = int(self.embedding_model.embedding_dimension)
+
+        if current_dimension == target_dimension:
+            return
+
+        if not self.embedding_model.supports_dimension_override:
+            raise ValueError(
+                "Embedding model dimension drift detected and cannot be corrected: "
+                f"store expects {target_dimension}, model is {current_dimension}."
+            )
+
+        self.embedding_model.configure_dimension(target_dimension, source="vector_store")
+        self._refresh_embedding_contract()
+        logger.warning(
+            "Re-aligned embedding model dimension for MongoVectorStore %s.%s: %s -> %s",
+            self.database,
+            self.collection,
+            current_dimension,
+            target_dimension,
+        )
     
     async def search(
         self,
@@ -430,6 +462,8 @@ class MongoVectorStore(BaseVectorStore):
         """
         if self.auto_setup:
             await self.ensure_backend_ready(create_indexes=True)
+
+        self._ensure_embedding_dimension_alignment()
 
         # Embed the query
         query_embedding = await self.embedding_model.embed(
@@ -640,6 +674,8 @@ class MongoVectorStore(BaseVectorStore):
         """
         if self.auto_setup:
             await self.ensure_backend_ready(create_indexes=True)
+
+        self._ensure_embedding_dimension_alignment()
 
         # Validate inputs
         self._validate_inputs(texts, metadatas, ids)

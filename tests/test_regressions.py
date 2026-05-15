@@ -1627,6 +1627,27 @@ class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Query embedding dimension mismatch", str(ctx.exception))
 
+    async def test_search_realigns_embedding_dimension_after_external_drift(self):
+        class _DynamicEmbeddingModel(_FakeEmbeddingModel):
+            async def embed(self, text, mode="document"):
+                self.embed_calls.append(text)
+                return [float(i) for i in range(self.embedding_dimension)]
+
+        model = _DynamicEmbeddingModel(default_dimension=2, supports_dimension_override=True)
+        store, _ = self._build_store(embedding_model=model)
+        store._collection = object()
+        store._hybrid_search = AsyncMock(return_value=[{"id": "doc-h"}])
+
+        # Simulate a shared model instance being reconfigured elsewhere.
+        model.configure_dimension(3, source="external")
+
+        result = await store.search("benefits policy")
+
+        self.assertEqual(result, [{"id": "doc-h"}])
+        self.assertEqual(model.embedding_dimension, 2)
+        self.assertEqual(model.dimension_source, "vector_store")
+        store._hybrid_search.assert_awaited_once_with([0.0, 1.0], "benefits policy", 4, None)
+
     async def test_vector_search_builds_pipeline_with_prefilter(self):
         fake_collection = _FakeMongoCollectionForVectorStore(
             aggregate_results=[

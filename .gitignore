@@ -13,4 +13,4 @@ wheels/
 
 # AI stuff
 plans/
-.context/
+.context/playground.ipynb

@@ -623,7 +623,7 @@ class GeminiEmbedding(EmbeddingModel):
             client = self._get_client()
             request_kwargs: Dict[str, Any] = {
                 "model": self.model,
-                "contents": prepared_text,
+                "contents": [prepared_text],
             }
 
             config_kwargs = self._build_embed_config(normalized_mode)

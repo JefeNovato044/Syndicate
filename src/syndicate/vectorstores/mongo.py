@@ -503,7 +503,7 @@ class MongoVectorStore(BaseVectorStore):
         })
         
         # Execute aggregation
-        cursor = collection.aggregate(pipeline)
+        cursor = await collection.aggregate(pipeline)
         results = await cursor.to_list(length=k)
         
         # Convert ObjectId to string and ensure metadata is dict
@@ -537,7 +537,7 @@ class MongoVectorStore(BaseVectorStore):
                 "text": {
                     "query": query,
                     "path": "text",
-                    "fuzzy": {"factor": 0.5}
+                    "fuzzy": {"maxEdits": 1}
                 }
             }
         }
@@ -563,7 +563,7 @@ class MongoVectorStore(BaseVectorStore):
         
         # Execute aggregation
         try:
-            cursor = collection.aggregate(pipeline)
+            cursor = await collection.aggregate(pipeline)
             results = await cursor.to_list(length=k)
             return self._format_results(results)
         except OperationFailure as e:

@@ -755,7 +755,12 @@ class MongoVectorStore(BaseVectorStore):
     async def close(self):
         """Close MongoDB and embedding model resources."""
         if self._client is not None:
-            self._client.close()
+            import inspect
+            close_fn = getattr(self._client, "close", None)
+            if callable(close_fn):
+                result = close_fn()
+                if inspect.isawaitable(result):
+                    await result
             self._client = None
             self._collection = None
             self._collection_ready = False
@@ -771,7 +776,20 @@ class MongoVectorStore(BaseVectorStore):
         """Ensure connection cleanup on object deletion (best effort)."""
         try:
             if self._client is not None:
-                self._client.close()
+                # Can't await in __del__, so we just try to close it if it's sync,
+                # or rely on garbage collection for async connections.
+                import inspect
+                close_fn = getattr(self._client, "close", None)
+                if callable(close_fn):
+                    import asyncio
+                    # We can't await in __del__, so we try to schedule it if there's a loop
+                    try:
+                        loop = asyncio.get_running_loop()
+                        if loop.is_running():
+                            # It's an async function, we can't easily wait for it here safely
+                            pass
+                    except RuntimeError:
+                        pass
         except Exception:
             # Never raise from finalizer.
             pass

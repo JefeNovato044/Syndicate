@@ -1324,6 +1324,7 @@ class BaseAgent(ABC):
         while iteration < max_iterations:
             accumulated_content = ""
             accumulated_thinking = ""
+            accumulated_thinking_tokens = None
             accumulated_tool_calls = []
             model_call_started_at = asyncio.get_running_loop().time()
             await self._emit_observer_hook(
@@ -1350,30 +1351,46 @@ class BaseAgent(ABC):
                     if chunk.finish_reason is not None:
                         final_finish_reason = chunk.finish_reason
 
+                    chunk_thinking_tokens = chunk.thinking_tokens
+                    if chunk_thinking_tokens is None and isinstance(chunk.usage, dict):
+                        usage_thinking_tokens = chunk.usage.get("thinking_tokens")
+                        if isinstance(usage_thinking_tokens, (int, float)) and not isinstance(usage_thinking_tokens, bool):
+                            chunk_thinking_tokens = int(usage_thinking_tokens)
+
+                    if chunk_thinking_tokens is not None:
+                        accumulated_thinking_tokens = chunk_thinking_tokens
+
                     # Yield thinking contents to the UI
-                    if chunk.thinking and include_thinking:
-                        yield StreamChunk(
-                            thinking=chunk.thinking,
-                            is_finished=chunk.is_finished,
-                            finish_reason=chunk.finish_reason,
-                        )
+                    if chunk.thinking:
                         accumulated_thinking += chunk.thinking or ""
+                        if include_thinking:
+                            yield StreamChunk(
+                                thinking=chunk.thinking,
+                                thinking_tokens=chunk_thinking_tokens,
+                                is_finished=chunk.is_finished,
+                                finish_reason=chunk.finish_reason,
+                                usage=chunk.usage,
+                            )
 
                     # Yield content chunks to the UI
                     if chunk.content:
                         yield StreamChunk(
                             content=chunk.content,
+                            thinking_tokens=chunk_thinking_tokens,
                             is_finished=chunk.is_finished,
                             finish_reason=chunk.finish_reason,
+                            usage=chunk.usage,
                         )
                         accumulated_content += chunk.content
-                    elif chunk.is_finished and not chunk.thinking:
+                    elif chunk.is_finished and not (chunk.thinking and include_thinking):
                         # Ensure callers waiting for terminal chunk get completion
                         # signal even when model emitted no textual content
                         # (e.g., tool-call-only turns).
                         yield StreamChunk(
                             is_finished=True,
                             finish_reason=chunk.finish_reason,
+                            thinking_tokens=chunk_thinking_tokens,
+                            usage=chunk.usage,
                         )
 
                     # Accumulate tool calls JSON (silently)
@@ -1426,8 +1443,13 @@ class BaseAgent(ABC):
                         requested_tool_calls=len(accumulated_tool_calls),
                     )
 
-                    if accumulated_content:
-                        messages.append(Message(role="ai", content=accumulated_content))
+                    if accumulated_content or accumulated_thinking:
+                        messages.append(Message(
+                            role="ai",
+                            content=accumulated_content,
+                            thinking=accumulated_thinking or None,
+                            thinking_tokens=accumulated_thinking_tokens,
+                        ))
                     messages.append(Message(role="ai", content=guardrail_message))
 
                     yield StreamChunk(
@@ -1443,6 +1465,8 @@ class BaseAgent(ABC):
                 messages.append(Message(
                     role="ai",
                     content=accumulated_content,
+                    thinking=accumulated_thinking or None,
+                    thinking_tokens=accumulated_thinking_tokens,
                     tool_calls=accumulated_tool_calls
                 ))
 
@@ -1503,6 +1527,8 @@ class BaseAgent(ABC):
             messages.append(Message(
                 role="ai",
                 content=accumulated_content,
+                thinking=accumulated_thinking or None,
+                thinking_tokens=accumulated_thinking_tokens,
                 tool_calls=accumulated_tool_calls
             ))
             

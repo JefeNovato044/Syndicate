@@ -551,6 +551,7 @@ class GeminiClient(Client):
             # Extract text content, thinking, and tool calls from chunk
             content = ""
             thinking = None
+            thinking_tokens = None
             tool_calls = None
             
             if hasattr(chunk, 'candidates') and chunk.candidates:
@@ -604,14 +605,42 @@ class GeminiClient(Client):
                 candidate = chunk.candidates[0]
                 if hasattr(candidate, 'finish_reason'):
                     finish_reason = str(candidate.finish_reason)
+
+            # Extract chunk-level usage metadata when available.
+            usage = None
+            if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata is not None:
+                usage_meta = chunk.usage_metadata
+                usage = {}
+
+                prompt_tokens = getattr(usage_meta, 'prompt_token_count', None)
+                if isinstance(prompt_tokens, (int, float)) and not isinstance(prompt_tokens, bool):
+                    usage["prompt_tokens"] = int(prompt_tokens)
+
+                completion_tokens = getattr(usage_meta, 'candidates_token_count', None)
+                if isinstance(completion_tokens, (int, float)) and not isinstance(completion_tokens, bool):
+                    usage["completion_tokens"] = int(completion_tokens)
+
+                total_tokens = getattr(usage_meta, 'total_token_count', None)
+                if isinstance(total_tokens, (int, float)) and not isinstance(total_tokens, bool):
+                    usage["total_tokens"] = int(total_tokens)
+
+                raw_thinking_tokens = getattr(usage_meta, 'thoughts_token_count', None)
+                if isinstance(raw_thinking_tokens, (int, float)) and not isinstance(raw_thinking_tokens, bool):
+                    thinking_tokens = int(raw_thinking_tokens)
+                    usage["thinking_tokens"] = thinking_tokens
+
+                if not usage:
+                    usage = None
             
             # Yield chunk
             yield StreamChunk(
                 content=content,
                 thinking=thinking,
+                thinking_tokens=thinking_tokens,
                 is_finished=(finish_reason is not None),
                 finish_reason=finish_reason,
-                tool_calls=tool_calls
+                tool_calls=tool_calls,
+                usage=usage,
             )
     
     def close(self):

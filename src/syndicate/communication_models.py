@@ -317,6 +317,7 @@ class StreamChunk(BaseModel):
     is_finished: bool = Field(default=False, description="Whether this is the final chunk")
     finish_reason: Optional[str] = Field(None, description="Why generation stopped (stop, length, etc.)")
     thinking: Optional[str] = Field(None, description="Internal reasoning (for o1, DeepSeek-R1, etc.)")
+    thinking_tokens: Optional[int] = Field(None, description="Tokens used in thinking for this stream response")
 
     # If the LLM decides to call a tool mid-stream, the Client normalizes it here
     tool_calls: Optional[List[ToolCall]] = Field(

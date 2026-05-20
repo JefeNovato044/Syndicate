@@ -685,6 +685,56 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
             {"inline_data": {"mime_type": "image/jpeg", "data": "BASE64_IMAGE"}},
         )
 
+    async def test_chat_completion_stream_emits_thinking_tokens_usage(self):
+        client = GeminiClient.__new__(GeminiClient)
+        client.model_name = "gemini-test"
+        client.temperature = 0.3
+        client._decode_messages = lambda messages: ([{"role": "user", "parts": [{"text": "hi"}]}], "sys")
+        client._format_tools = lambda tools: None
+
+        part = SimpleNamespace(text="hello", thought="internal", function_call=None)
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[part]),
+            finish_reason="STOP",
+        )
+        usage = SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=5,
+            total_token_count=15,
+            thoughts_token_count=4,
+        )
+
+        async def _chunk_iter():
+            yield SimpleNamespace(candidates=[candidate], usage_metadata=usage)
+
+        fake_stream = AsyncMock(return_value=_chunk_iter())
+        client.client = SimpleNamespace(
+            aio=SimpleNamespace(
+                models=SimpleNamespace(generate_content_stream=fake_stream)
+            )
+        )
+
+        with patch(
+            "syndicate.clients.gemini.types.GenerateContentConfig",
+            side_effect=lambda **kw: kw,
+        ):
+            chunks = []
+            async for chunk in client.chat_completion_stream(
+                messages=[Message(role="human", content="hello")],
+                system_message=Message(role="system", content="sys"),
+            ):
+                chunks.append(chunk)
+
+        self.assertEqual(len(chunks), 1)
+        stream_chunk = chunks[0]
+        self.assertEqual(stream_chunk.content, "hello")
+        self.assertEqual(stream_chunk.thinking, "internal")
+        self.assertEqual(stream_chunk.thinking_tokens, 4)
+        self.assertEqual(stream_chunk.usage["prompt_tokens"], 10)
+        self.assertEqual(stream_chunk.usage["completion_tokens"], 5)
+        self.assertEqual(stream_chunk.usage["total_tokens"], 15)
+        self.assertEqual(stream_chunk.usage["thinking_tokens"], 4)
+
     def test_encode_response_extracts_tool_call_and_thought_signature(self):
         client = GeminiClient.__new__(GeminiClient)
 
@@ -2020,10 +2070,14 @@ class GeminiSchemaCleaningTests(unittest.TestCase):
 class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
     """Tests that _orchestrate_stream emits ToolCallEvent chunks around tool dispatch."""
 
-    def _make_agent(self, tool_result, tool_error=None):
+    def _make_agent(
+        self,
+        tool_result,
+        tool_error=None,
+        first_turn_thinking=None,
+        first_turn_thinking_tokens=None,
+    ):
         """Build a minimal BaseAgent wired with a fake LLM and a fake tool."""
-        from syndicate.communication_models import ToolCallEvent
-
         # One-shot LLM: first call returns a tool_call, second returns final text
         call_count = {"n": 0}
 
@@ -2035,6 +2089,8 @@ class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
                 if call_count["n"] == 1:
                     # First turn: yield a tool call
                     yield StreamChunk(
+                        thinking=first_turn_thinking,
+                        thinking_tokens=first_turn_thinking_tokens,
                         tool_calls=[ToolCall(id="ev_id_1", name="fake_tool", arguments={"x": 1})],
                         is_finished=True,
                         finish_reason="tool_calls",
@@ -2069,8 +2125,6 @@ class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
         return agent
 
     async def test_stream_emits_start_and_success_events(self):
-        from syndicate.communication_models import ToolCallEvent
-
         agent = self._make_agent(tool_result="tool_output")
 
         messages = [Message(role="human", content="go")]
@@ -2098,6 +2152,64 @@ class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
         # Final text chunk must also arrive
         text_chunks = [c for c in chunks if c.content]
         self.assertTrue(any(c.content == "done" for c in text_chunks))
+
+    async def test_stream_persists_thinking_metadata_on_tool_call_turn(self):
+        agent = self._make_agent(
+            tool_result="tool_output",
+            first_turn_thinking="inspect weather inputs",
+            first_turn_thinking_tokens=11,
+        )
+
+        async for _ in agent.stream(
+            "go",
+            owner_id="thinking-owner",
+            chat_id="thinking-chat",
+            include_thinking=True,
+        ):
+            pass
+
+        history = await agent.get_history(owner_id="thinking-owner", chat_id="thinking-chat")
+        tool_call_turn = next(
+            (message for message in history if message.role == "ai" and message.tool_calls),
+            None,
+        )
+
+        self.assertIsNotNone(tool_call_turn)
+        self.assertEqual(tool_call_turn.thinking, "inspect weather inputs")
+        self.assertEqual(tool_call_turn.thinking_tokens, 11)
+
+    async def test_stream_persists_thinking_tokens_on_final_text_turn(self):
+        class _ThinkingFinalLLM:
+            provider_type = "openai"
+
+            async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+                yield StreamChunk(thinking="draft ", thinking_tokens=3, is_finished=False)
+                yield StreamChunk(thinking="answer", thinking_tokens=5, is_finished=False)
+                yield StreamChunk(content="done", is_finished=True, finish_reason="stop")
+
+        agent = BaseAgent(
+            llm_client=_ThinkingFinalLLM(),
+            memory=LocalMemory(rollover_enabled=False),
+            system_prompt="sys",
+            tools=[],
+            max_iterations=4,
+        )
+
+        async for _ in agent.stream(
+            "go",
+            owner_id="final-owner",
+            chat_id="final-chat",
+            include_thinking=True,
+        ):
+            pass
+
+        history = await agent.get_history(owner_id="final-owner", chat_id="final-chat")
+        ai_messages = [message for message in history if message.role == "ai"]
+
+        self.assertEqual(len(ai_messages), 1)
+        self.assertEqual(ai_messages[0].content, "done")
+        self.assertEqual(ai_messages[0].thinking, "draft answer")
+        self.assertEqual(ai_messages[0].thinking_tokens, 5)
 
     async def test_public_stream_surface_forwards_tool_call_events(self):
         """Regression: stream() shell was dropping ToolCallEvent chunks because

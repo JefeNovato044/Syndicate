@@ -265,11 +265,22 @@ class GeminiClient(Client):
                 text_parts = []
                 thinking_parts = []
                 for part in candidate.content.parts:
-                    if hasattr(part, 'text') and part.text:
-                        text_parts.append(part.text)
-                    # Extract thinking/reasoning content (for thinking models)
-                    if hasattr(part, 'thought') and part.thought:
-                        thinking_parts.append(str(part.thought))
+                    part_text = getattr(part, 'text', None)
+                    raw_thought = getattr(part, 'thought', None)
+
+                    # Gemini thought parts are flagged with thought=True and place
+                    # the actual reasoning text in part.text.
+                    is_thought_part = isinstance(raw_thought, bool) and raw_thought
+                    if part_text:
+                        if is_thought_part:
+                            thinking_parts.append(part_text)
+                        else:
+                            text_parts.append(part_text)
+
+                    # Compatibility path for mocked/non-standard payloads where
+                    # the thought string itself is stored directly in `thought`.
+                    if isinstance(raw_thought, str) and raw_thought:
+                        thinking_parts.append(raw_thought)
                 content = ''.join(text_parts)
                 if thinking_parts:
                     thinking = ''.join(thinking_parts)
@@ -409,6 +420,7 @@ class GeminiClient(Client):
         image: Optional[Any] = None,
         tools: Optional[List[Any]] = None,
         thinking_level: Optional[str] = None,
+        include_thoughts: Optional[bool] = None,
         **kwargs
     ) -> ChatResponse:
         """
@@ -420,6 +432,7 @@ class GeminiClient(Client):
             image: Optional image data (base64 encoded string or bytes)
             tools: Optional list of tool definitions (BaseTool instances or dicts)
             thinking_level: Optional thinking level for extended thinking ("none", "low", "medium", "high")
+            include_thoughts: Optional flag to request thought text in the response
             **kwargs: Additional parameters for Gemini API
             
         Returns:
@@ -455,8 +468,13 @@ class GeminiClient(Client):
             "tools": formatted_tools if formatted_tools else None,
         }
         
-        if thinking_level:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+        thinking_config_kwargs = {}
+        if thinking_level is not None:
+            thinking_config_kwargs["thinking_level"] = thinking_level
+        if include_thoughts is not None:
+            thinking_config_kwargs["include_thoughts"] = include_thoughts
+        if thinking_config_kwargs:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
         
         # Forward any extra provider-specific kwargs (e.g. top_p, top_k, max_output_tokens)
         _known_kwargs = {"temperature"}
@@ -483,6 +501,7 @@ class GeminiClient(Client):
         image: Optional[Any] = None,
         tools: Optional[List[Any]] = None,
         thinking_level: Optional[str] = None,
+        include_thoughts: Optional[bool] = None,
         **kwargs
     ) -> AsyncGenerator[StreamChunk, None]:
         """
@@ -494,6 +513,7 @@ class GeminiClient(Client):
             image: Optional image data (base64 encoded string or bytes)
             tools: Optional list of tool definitions (BaseTool instances or dicts)
             thinking_level: Optional thinking level for extended thinking ("none", "low", "medium", "high")
+            include_thoughts: Optional flag to request thought text in the response
             **kwargs: Additional parameters
             
         Yields:
@@ -529,8 +549,13 @@ class GeminiClient(Client):
             "tools": formatted_tools if formatted_tools else None,
         }
         
-        if thinking_level:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+        thinking_config_kwargs = {}
+        if thinking_level is not None:
+            thinking_config_kwargs["thinking_level"] = thinking_level
+        if include_thoughts is not None:
+            thinking_config_kwargs["include_thoughts"] = include_thoughts
+        if thinking_config_kwargs:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
         
         # Forward any extra provider-specific kwargs (e.g. top_p, top_k, max_output_tokens)
         _known_kwargs = {"temperature"}
@@ -560,11 +585,22 @@ class GeminiClient(Client):
                     text_parts = []
                     thinking_parts = []
                     for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_parts.append(part.text)
-                        # Extract thinking/reasoning content (for thinking models)
-                        if hasattr(part, 'thought') and part.thought:
-                            thinking_parts.append(str(part.thought))
+                        part_text = getattr(part, 'text', None)
+                        raw_thought = getattr(part, 'thought', None)
+
+                        # Gemini thought parts are flagged with thought=True and place
+                        # the actual reasoning text in part.text.
+                        is_thought_part = isinstance(raw_thought, bool) and raw_thought
+                        if part_text:
+                            if is_thought_part:
+                                thinking_parts.append(part_text)
+                            else:
+                                text_parts.append(part_text)
+
+                        # Compatibility path for mocked/non-standard payloads where
+                        # the thought string itself is stored directly in `thought`.
+                        if isinstance(raw_thought, str) and raw_thought:
+                            thinking_parts.append(raw_thought)
                         # Check for function calls in streaming
                         if hasattr(part, 'function_call') and part.function_call:
                             if tool_calls is None:

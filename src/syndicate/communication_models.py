@@ -335,7 +335,11 @@ class StreamChunk(BaseModel):
     usage: Optional[Dict[str, int]] = Field(default=None)
     
     def __str__(self) -> str:
-        return self.content
+        if self.content:
+            return self.content
+        if self.thinking:
+            return self.thinking
+        return ""
 
 
 # ============================================================================

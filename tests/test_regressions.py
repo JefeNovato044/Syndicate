@@ -658,6 +658,7 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
                 image="BASE64_IMAGE",
                 tools=[fake_tool],
                 thinking_level="medium",
+                include_thoughts=True,
             )
 
         self.assertEqual(response.content, "ok")
@@ -676,6 +677,7 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
             "weather_tool",
         )
         self.assertEqual(call_kwargs["config"]["thinking_config"]["thinking_level"], "medium")
+        self.assertTrue(call_kwargs["config"]["thinking_config"]["include_thoughts"])
 
         contents = call_kwargs["contents"]
         self.assertEqual(contents[-1]["role"], "user")
@@ -735,6 +737,84 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream_chunk.usage["total_tokens"], 15)
         self.assertEqual(stream_chunk.usage["thinking_tokens"], 4)
 
+    async def test_chat_completion_stream_extracts_thinking_from_thought_marked_text_parts(self):
+        client = GeminiClient.__new__(GeminiClient)
+        client.model_name = "gemini-test"
+        client.temperature = 0.3
+        client._decode_messages = lambda messages: ([{"role": "user", "parts": [{"text": "hi"}]}], "sys")
+        client._format_tools = lambda tools: None
+
+        thought_part = SimpleNamespace(text="internal rationale", thought=True, function_call=None)
+        answer_part = SimpleNamespace(text="final answer", thought=False, function_call=None)
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[thought_part, answer_part]),
+            finish_reason="STOP",
+        )
+        usage = SimpleNamespace(thoughts_token_count=9)
+
+        async def _chunk_iter():
+            yield SimpleNamespace(candidates=[candidate], usage_metadata=usage)
+
+        fake_stream = AsyncMock(return_value=_chunk_iter())
+        client.client = SimpleNamespace(
+            aio=SimpleNamespace(
+                models=SimpleNamespace(generate_content_stream=fake_stream)
+            )
+        )
+
+        with patch(
+            "syndicate.clients.gemini.types.GenerateContentConfig",
+            side_effect=lambda **kw: kw,
+        ):
+            chunks = []
+            async for chunk in client.chat_completion_stream(
+                messages=[Message(role="human", content="hello")],
+                system_message=Message(role="system", content="sys"),
+            ):
+                chunks.append(chunk)
+
+        self.assertEqual(len(chunks), 1)
+        stream_chunk = chunks[0]
+        self.assertEqual(stream_chunk.content, "final answer")
+        self.assertEqual(stream_chunk.thinking, "internal rationale")
+        self.assertEqual(stream_chunk.thinking_tokens, 9)
+
+    async def test_chat_completion_stream_sets_include_thoughts_config_when_requested(self):
+        client = GeminiClient.__new__(GeminiClient)
+        client.model_name = "gemini-test"
+        client.temperature = 0.3
+        client._decode_messages = lambda messages: ([{"role": "user", "parts": [{"text": "hi"}]}], "sys")
+        client._format_tools = lambda tools: None
+
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[SimpleNamespace(text="ok", thought=False, function_call=None)]),
+            finish_reason="STOP",
+        )
+
+        async def _chunk_iter():
+            yield SimpleNamespace(candidates=[candidate], usage_metadata=SimpleNamespace())
+
+        fake_stream = AsyncMock(return_value=_chunk_iter())
+        client.client = SimpleNamespace(
+            aio=SimpleNamespace(
+                models=SimpleNamespace(generate_content_stream=fake_stream)
+            )
+        )
+
+        with patch("syndicate.clients.gemini.types.ThinkingConfig", side_effect=lambda **kw: kw), patch(
+            "syndicate.clients.gemini.types.GenerateContentConfig",
+            side_effect=lambda **kw: kw,
+        ):
+            async for _ in client.chat_completion_stream(
+                messages=[Message(role="human", content="hello")],
+                system_message=Message(role="system", content="sys"),
+                include_thoughts=True,
+            ):
+                pass
+
+        call_kwargs = fake_stream.call_args.kwargs
+        self.assertTrue(call_kwargs["config"]["thinking_config"]["include_thoughts"])
+
     def test_encode_response_extracts_tool_call_and_thought_signature(self):
         client = GeminiClient.__new__(GeminiClient)
 
@@ -791,6 +871,34 @@ class GeminiClientContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(encoded.tool_calls)
         self.assertEqual(encoded.tool_calls[0].id, "call_xyz789")
+
+    def test_encode_response_extracts_thinking_from_thought_marked_text_parts(self):
+        client = GeminiClient.__new__(GeminiClient)
+
+        thought_part = SimpleNamespace(
+            text="internal chain",
+            thought=True,
+            function_call=None,
+            thought_signature=None,
+        )
+        answer_part = SimpleNamespace(
+            text="final",
+            thought=False,
+            function_call=None,
+            thought_signature=None,
+        )
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[thought_part, answer_part]),
+            finish_reason="STOP",
+        )
+        usage = SimpleNamespace(thoughts_token_count=6)
+        raw = SimpleNamespace(candidates=[candidate], usage_metadata=usage)
+
+        encoded = client._encode_response(raw)
+
+        self.assertEqual(encoded.content, "final")
+        self.assertEqual(encoded.thinking, "internal chain")
+        self.assertEqual(encoded.thinking_tokens, 6)
 
     def test_encode_response_accepts_bytes_thought_signature(self):
         client = GeminiClient.__new__(GeminiClient)
@@ -2258,6 +2366,35 @@ class ToolCallEventStreamTests(unittest.IsolatedAsyncioTestCase):
             content += chunk.content  # tool_call chunks have content="" by default
 
         self.assertEqual(content, "done")
+
+    async def test_stream_include_thinking_auto_sets_gemini_include_thoughts_and_renders(self):
+        class _GeminiLikeLLM:
+            provider_type = "gemini"
+
+            def __init__(self):
+                self.kwargs_seen = None
+
+            async def chat_completion_stream(self, messages, system_message, tools=None, **kwargs):
+                self.kwargs_seen = kwargs
+                yield StreamChunk(thinking="internal rationale", is_finished=False)
+                yield StreamChunk(content="done", is_finished=True, finish_reason="stop")
+
+        llm = _GeminiLikeLLM()
+        agent = BaseAgent(
+            llm_client=llm,
+            memory=LocalMemory(rollover_enabled=False),
+            system_prompt="sys",
+            tools=[],
+            max_iterations=4,
+        )
+
+        chunks = []
+        async for chunk in agent.stream("go", include_thinking=True):
+            chunks.append(chunk)
+
+        self.assertEqual(chunks[0].thinking, "internal rationale")
+        self.assertEqual(str(chunks[0]), "internal rationale")
+        self.assertTrue(llm.kwargs_seen.get("include_thoughts"))
 
 
 class ToolResultEnvelopeTests(unittest.IsolatedAsyncioTestCase):

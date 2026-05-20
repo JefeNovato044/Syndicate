@@ -1339,11 +1339,14 @@ class BaseAgent(ABC):
             try:
                 # Call LLM with streaming
                 active_tools = formatted_tools if formatted_tools is not None else self._get_request_formatted_tools()
+                model_kwargs = dict(kwargs)
+                if include_thinking and getattr(self, "provider", None) == "gemini":
+                    model_kwargs.setdefault("include_thoughts", True)
                 stream = self.llm.chat_completion_stream(
                     messages=messages,
                     system_message=Message(content=self._get_request_system_prompt(), role='system'),
                     tools=active_tools,
-                    **kwargs
+                    **model_kwargs
                 )
 
                 # Stream the response

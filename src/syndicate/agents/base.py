@@ -865,7 +865,7 @@ class BaseAgent(ABC):
             else:
                 # Fallback for non-BaseTool objects
                 formatted_tools.append(tool_instance)
-        #print(formatted_tools)
+
         return formatted_tools
 
     def _snapshot_request_config(self) -> Dict[str, Any]:

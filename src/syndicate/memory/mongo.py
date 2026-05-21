@@ -192,8 +192,6 @@ class MongoMemory(BaseChatMemory):
         # Serialize message to dict for MongoDB
         message_dict = self._message_to_dict(message)
 
-        print("Adding message to MongoDB:", message_dict)
-
         # Add message to bucket in MongoDB
         await self._collection.update_one(
             {"bucket_id": bucket.bucket_id},
@@ -638,7 +636,6 @@ class MongoMemory(BaseChatMemory):
         if message.tool_call_id is not None:
             doc["tool_call_id"] = message.tool_call_id
         if message.metadata:
-            print("Storing message metadata:", message.metadata)
             doc["metadata"] = message.metadata
 
         return doc

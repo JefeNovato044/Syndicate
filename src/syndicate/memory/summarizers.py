@@ -131,7 +131,7 @@ def format_messages_for_summary(messages: List[Message]) -> str:
 # DEFAULT SUMMARIZER FACTORY
 # =============================================================================
 
-def create_default_summarizer(llm_client: Client) -> SummarizerCallable:
+def create_default_summarizer(llm_client: "Client") -> SummarizerCallable:
     """
     Factory that creates a summarizer callable bound to a specific LLM client.
     

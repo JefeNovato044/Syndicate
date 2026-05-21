@@ -18,7 +18,7 @@ from syndicate.communication_models import Message, ToolCall, ChatResponse, Stre
 from syndicate.clients.gemini import GeminiClient
 from syndicate.clients.openai import OpenAIClient
 from syndicate.memory.local import LocalMemory
-from syndicate.memory.summarizers import resolve_summarizer
+from syndicate.memory.summarizers import create_default_summarizer, resolve_summarizer
 from pymongo.errors import DuplicateKeyError, OperationFailure
 from syndicate.memory.mongo import MongoMemory
 from syndicate.memory.sqlite_postgres import SqlitePostgresMemory
@@ -2589,6 +2589,10 @@ class SummarizerAgentCompatibilityTests(IsolatedAsyncioTestCase):
                 )
 
         self.assertIn("Expected a string response", str(ctx.exception))
+
+    def test_default_summarizer_uses_forward_ref_annotation_for_client(self):
+        annotations = create_default_summarizer.__annotations__
+        self.assertEqual(annotations.get("llm_client"), "Client")
 
 
 class ObserverLifecycleHookTests(unittest.IsolatedAsyncioTestCase):

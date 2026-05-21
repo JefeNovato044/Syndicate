@@ -24,6 +24,7 @@ class Message(BaseModel):
     role: Literal['human', 'ai', 'system', 'tool'] = Field(..., description="Role of the message sender: 'human', 'ai', 'system', or 'tool'.")
     content: str = Field(..., description="Content of the message.")
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Timestamp of the message in UTC.")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the message.")
     
     
     # AI-Specific: When the model initiates an action

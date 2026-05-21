@@ -515,6 +515,7 @@ class BaseAgent(ABC):
         owner_id: str = "default",
         chat_id: str = "default",
         include_thinking: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> AsyncGenerator[StreamChunk, None]:
         """
@@ -556,7 +557,7 @@ class BaseAgent(ABC):
 
         try:
             # Build messages with history (this adds the user message at the end)
-            messages = await self._build_messages(user_input, owner_id, chat_id)
+            messages = await self._build_messages(user_input, owner_id, chat_id, metadata)
 
             # Capture the user message (last message added by _build_messages)
             user_message = messages[-1]
@@ -633,7 +634,7 @@ class BaseAgent(ABC):
                 )
             observer_ctx.reset(observer_ctx_token)
 
-    async def _build_messages(self, user_input: str, owner_id: str, chat_id: str) -> List[Message]:
+    async def _build_messages(self, user_input: str, owner_id: str, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> List[Message]:
         """
         Build message list from history and current input.
         
@@ -652,7 +653,7 @@ class BaseAgent(ABC):
         messages.extend(await self.get_history(owner_id, chat_id))
         
         # Add current user input
-        messages.append(Message(content=user_input, role="human"))
+        messages.append(Message(content=user_input, role="human", metadata=metadata or {}))
         
         return messages
     

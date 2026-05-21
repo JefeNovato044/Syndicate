@@ -7,6 +7,7 @@ full support for bucket-based rollover and summarization.
 Uses PyMongo's native async API (replacement for Motor).
 """
 
+from math import log
 from typing import Optional, List, Dict, Any
 import logging
 from uuid import uuid4
@@ -191,6 +192,8 @@ class MongoMemory(BaseChatMemory):
 
         # Serialize message to dict for MongoDB
         message_dict = self._message_to_dict(message)
+
+        print("Adding message to MongoDB:", message_dict)
 
         # Add message to bucket in MongoDB
         await self._collection.update_one(
@@ -616,6 +619,7 @@ class MongoMemory(BaseChatMemory):
 
     def _message_to_dict(self, message: Message) -> Dict[str, Any]:
         """Convert a Message to a MongoDB-storable dict."""
+        
         doc = {
             "role": message.role,
             "content": message.content,
@@ -634,6 +638,9 @@ class MongoMemory(BaseChatMemory):
             doc["thinking_tokens"] = message.thinking_tokens
         if message.tool_call_id is not None:
             doc["tool_call_id"] = message.tool_call_id
+        if message.metadata:
+            print("Storing message metadata:", message.metadata)
+            doc["metadata"] = message.metadata
 
         return doc
 
@@ -660,6 +667,7 @@ class MongoMemory(BaseChatMemory):
             thinking=doc.get("thinking"),
             thinking_tokens=doc.get("thinking_tokens"),
             tool_call_id=doc.get("tool_call_id"),
+            metadata=doc.get("metadata", {}),
         )
 
     def _doc_to_bucket(self, doc: Dict[str, Any]) -> MessageBucket:

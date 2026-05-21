@@ -373,6 +373,7 @@ class BaseAgent(ABC):
         user_input: str,
         owner_id: str = "default",
         chat_id: str = "default",
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> str:
         """
@@ -411,7 +412,7 @@ class BaseAgent(ABC):
 
         try:
             # Build messages with history (this adds the user message at the end)
-            messages = await self._build_messages(user_input, owner_id, chat_id)
+            messages = await self._build_messages(user_input, owner_id, chat_id, metadata)
 
             # Capture the user message (last message added by _build_messages)
             user_message = messages[-1]
@@ -474,6 +475,7 @@ class BaseAgent(ABC):
         user_input: str,
         owner_id: str = "default",
         chat_id: str = "default",
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> str:
         """
@@ -501,12 +503,12 @@ class BaseAgent(ABC):
             asyncio.get_running_loop()
         except RuntimeError:
             # No event loop running — safe to use asyncio.run() directly.
-            return asyncio.run(self.invoke(user_input, owner_id, chat_id, **kwargs))
+            return asyncio.run(self.invoke(user_input, owner_id, chat_id, metadata, **kwargs))
 
         # A loop is already running (e.g. Jupyter / IPython kernel).
         # Spin up a worker thread with its own event loop to avoid nesting.
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, self.invoke(user_input, owner_id, chat_id, **kwargs))
+            future = pool.submit(asyncio.run, self.invoke(user_input, owner_id, chat_id, metadata, **kwargs))
             return future.result()
     
     async def stream(

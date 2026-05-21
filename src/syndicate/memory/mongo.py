@@ -7,7 +7,6 @@ full support for bucket-based rollover and summarization.
 Uses PyMongo's native async API (replacement for Motor).
 """
 
-from math import log
 from typing import Optional, List, Dict, Any
 import logging
 from uuid import uuid4

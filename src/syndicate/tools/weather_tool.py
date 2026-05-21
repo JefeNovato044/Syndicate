@@ -36,7 +36,6 @@ class CurrentWeatherTool(BaseTool):
         # Validate arguments using Pydantic schema
         args = self.args_schema(**kwargs)
 
-        print(f"Fetching weather for city: {args.city}, unit: {args.unit}")
         
         # Use validated arguments
         city_encoded = args.city.replace(" ", "%20").lower()

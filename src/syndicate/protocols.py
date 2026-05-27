@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, Protocol, runtime_checkable
 from collections.abc import AsyncGenerator
+from .communication_models import Message
 
 from .communication_models import StreamChunk
 
@@ -33,6 +34,16 @@ class AgentInterface(Protocol):
         owner_id: str = "default",
         chat_id: str = "default",
     ) -> str:
+        ...
+
+    async def get_full_history(
+        self,
+        owner_id: str = "default",
+        chat_id: str = "default",
+        include_closed_buckets: bool = True,
+        include_deleted: bool = False,
+    ) -> list[Message]:
+        """Retrieve the full conversation history for a chat session."""
         ...
 
 

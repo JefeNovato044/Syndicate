@@ -42,3 +42,17 @@ class AgentRuntime(AgentInterface):
         chat_id: str = "default",
     ) -> str:
         return self._agent.invoke_sync(user_input, owner_id=owner_id, chat_id=chat_id)
+    
+    async def get_full_history(
+        self,
+        owner_id: str = "default",
+        chat_id: str = "default",
+        include_closed_buckets: bool = True,
+        include_deleted: bool = False,
+    ) -> list:
+        return await self._agent.get_full_history(
+            owner_id=owner_id,
+            chat_id=chat_id,
+            include_closed_buckets=include_closed_buckets,
+            include_deleted=include_deleted,
+        )

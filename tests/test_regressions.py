@@ -1231,6 +1231,75 @@ class SqlitePostgresMemoryFullHistoryTests(unittest.IsolatedAsyncioTestCase):
                 if memory._engine is not None:
                     await memory._engine.dispose()
 
+
+class SqlitePostgresMemoryToolCallSerializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_roundtrip_preserves_string_thought_signature(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "thought_signature_string.db")
+            memory = SqlitePostgresMemory(
+                database_url=f"sqlite+aiosqlite:///{db_path}",
+            )
+
+            try:
+                await memory.add_message(
+                    Message(
+                        role="ai",
+                        content="",
+                        tool_calls=[
+                            ToolCall(
+                                id="call-1",
+                                name="weather",
+                                arguments={"city": "Tokyo"},
+                                thought_signature="signature-123",
+                            )
+                        ],
+                    ),
+                    "owner",
+                    "chat",
+                )
+
+                history = await memory.get_history("owner", "chat")
+                self.assertEqual(len(history), 1)
+                self.assertIsNotNone(history[0].tool_calls)
+                self.assertEqual(history[0].tool_calls[0].thought_signature, "signature-123")
+            finally:
+                if memory._engine is not None:
+                    await memory._engine.dispose()
+
+    async def test_roundtrip_preserves_bytes_thought_signature(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "thought_signature_bytes.db")
+            memory = SqlitePostgresMemory(
+                database_url=f"sqlite+aiosqlite:///{db_path}",
+            )
+
+            try:
+                expected_signature = b"\x12\x97sig-bytes"
+                await memory.add_message(
+                    Message(
+                        role="ai",
+                        content="",
+                        tool_calls=[
+                            ToolCall(
+                                id="call-2",
+                                name="weather",
+                                arguments={"city": "Tokyo"},
+                                thought_signature=expected_signature,
+                            )
+                        ],
+                    ),
+                    "owner",
+                    "chat",
+                )
+
+                history = await memory.get_history("owner", "chat")
+                self.assertEqual(len(history), 1)
+                self.assertIsNotNone(history[0].tool_calls)
+                self.assertEqual(history[0].tool_calls[0].thought_signature, expected_signature)
+            finally:
+                if memory._engine is not None:
+                    await memory._engine.dispose()
+
     async def test_hard_delete_removes_message_from_storage(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = os.path.join(tmp_dir, "delete_hard.db")
@@ -1691,6 +1760,55 @@ class MongoMemoryFullHistoryTests(unittest.IsolatedAsyncioTestCase):
             limit=2,
         )
         self.assertEqual([m.content for m in limited], ["u2", "a2"])
+
+
+class MongoMemoryToolCallSerializationTests(unittest.TestCase):
+    def test_message_dict_roundtrip_preserves_string_thought_signature(self):
+        memory = MongoMemory.__new__(MongoMemory)
+
+        original = Message(
+            role="ai",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="call-1",
+                    name="weather",
+                    arguments={"city": "Tokyo"},
+                    thought_signature="signature-123",
+                )
+            ],
+        )
+
+        serialized = memory._message_to_dict(original)
+        self.assertEqual(serialized["tool_calls"][0].get("thought_signature"), "signature-123")
+
+        roundtrip = memory._dict_to_message(serialized)
+        self.assertIsNotNone(roundtrip.tool_calls)
+        self.assertEqual(roundtrip.tool_calls[0].thought_signature, "signature-123")
+
+    def test_message_dict_roundtrip_preserves_bytes_thought_signature(self):
+        memory = MongoMemory.__new__(MongoMemory)
+
+        expected_signature = b"\x12\x97sig-bytes"
+        original = Message(
+            role="ai",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="call-2",
+                    name="weather",
+                    arguments={"city": "Tokyo"},
+                    thought_signature=expected_signature,
+                )
+            ],
+        )
+
+        serialized = memory._message_to_dict(original)
+        self.assertEqual(serialized["tool_calls"][0].get("thought_signature"), expected_signature)
+
+        roundtrip = memory._dict_to_message(serialized)
+        self.assertIsNotNone(roundtrip.tool_calls)
+        self.assertEqual(roundtrip.tool_calls[0].thought_signature, expected_signature)
 
 
 class MongoVectorStoreTests(unittest.IsolatedAsyncioTestCase):

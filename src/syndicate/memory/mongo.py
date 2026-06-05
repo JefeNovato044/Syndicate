@@ -626,7 +626,12 @@ class MongoMemory(BaseChatMemory):
         # Optional fields
         if message.tool_calls is not None:
             doc["tool_calls"] = [
-                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                {
+                    "id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                    "thought_signature": tc.thought_signature,
+                }
                 for tc in message.tool_calls
             ]
         if message.thinking is not None:
@@ -650,7 +655,8 @@ class MongoMemory(BaseChatMemory):
                 ToolCall(
                     id=tc["id"],
                     name=tc["name"],
-                    arguments=tc["arguments"]
+                    arguments=tc["arguments"],
+                    thought_signature=tc.get("thought_signature"),
                 )
                 for tc in doc["tool_calls"]
             ]

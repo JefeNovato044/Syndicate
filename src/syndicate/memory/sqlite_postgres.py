@@ -10,6 +10,8 @@ Uses SQLAlchemy 2.0+ async API with aiosqlite and asyncpg drivers.
 import json
 import logging
 import asyncio
+import base64
+import binascii
 from typing import Optional, List, Dict, Any
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -809,6 +811,42 @@ class SqlitePostgresMemory(BaseChatMemory):
     # UTILITY METHODS
     # =========================================================================
 
+    @staticmethod
+    def _encode_thought_signature(
+        thought_signature: Optional[bytes | str],
+    ) -> Optional[bytes | str | Dict[str, str]]:
+        """Serialize thought signatures for JSON-safe persistence."""
+        if thought_signature is None or isinstance(thought_signature, str):
+            return thought_signature
+
+        if isinstance(thought_signature, bytes):
+            return {
+                "encoding": "base64",
+                "value": base64.b64encode(thought_signature).decode("ascii"),
+            }
+
+        return str(thought_signature)
+
+    @staticmethod
+    def _decode_thought_signature(
+        thought_signature: Any,
+    ) -> Optional[bytes | str]:
+        """Deserialize persisted thought signatures into ToolCall-compatible types."""
+        if thought_signature is None:
+            return None
+
+        if isinstance(thought_signature, dict) and thought_signature.get("encoding") == "base64":
+            encoded_value = thought_signature.get("value")
+            if not isinstance(encoded_value, str):
+                return None
+            try:
+                return base64.b64decode(encoded_value, validate=True)
+            except (ValueError, TypeError, binascii.Error):
+                logger.warning("Invalid base64 thought_signature payload found in memory")
+                return None
+
+        return thought_signature
+
     def _message_to_dict(self, message: Message) -> Dict[str, Any]:
         """Convert a Message to a dict for JSON storage."""
         doc = {
@@ -820,7 +858,12 @@ class SqlitePostgresMemory(BaseChatMemory):
         # Optional fields
         if message.tool_calls is not None:
             doc["tool_calls"] = [
-                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                {
+                    "id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                    "thought_signature": self._encode_thought_signature(tc.thought_signature),
+                }
                 for tc in message.tool_calls
             ]
         if message.thinking is not None:
@@ -840,7 +883,8 @@ class SqlitePostgresMemory(BaseChatMemory):
                 ToolCall(
                     id=tc["id"],
                     name=tc["name"],
-                    arguments=tc["arguments"]
+                    arguments=tc["arguments"],
+                    thought_signature=self._decode_thought_signature(tc.get("thought_signature")),
                 )
                 for tc in doc["tool_calls"]
             ]

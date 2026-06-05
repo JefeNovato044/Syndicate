@@ -38,8 +38,15 @@ Example:
 import logging
 from typing import Any, Dict, List, Optional
 
-from elasticsearch import AsyncElasticsearch, NotFoundError
-from elasticsearch.helpers import async_bulk
+try:
+    from elasticsearch import AsyncElasticsearch, NotFoundError
+    from elasticsearch.helpers import async_bulk
+except ImportError as _es_import_error:  # noqa: F841
+    raise ImportError(
+        "The 'elasticsearch' package is required to use ElasticsearchVectorStore. "
+        "Install it with: pip install 'syndicate[elasticsearch]' "
+        "or: pip install 'elasticsearch[async]>=9.4.1'"
+    ) from None
 
 from .base import BaseVectorStore
 from ..ingestion.embedding_models import EmbeddingModel, EmbeddingMode

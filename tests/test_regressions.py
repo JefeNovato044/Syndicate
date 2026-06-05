@@ -3191,5 +3191,673 @@ class RAGSearchToolExtensibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("get_result_text", str(w[0].message))
 
 
+class _FakeElasticsearchIndices:
+    """Minimal fake for AsyncElasticsearch.indices namespace."""
+
+    def __init__(self, index_exists: bool = False, mapping: dict = None, create_error=None):
+        self._index_exists = index_exists
+        self._mapping = mapping or {}
+        self._create_error = create_error
+        self.created_indices = []
+
+    async def exists(self, index):
+        return self._index_exists
+
+    async def create(self, index, body=None):
+        if self._create_error is not None:
+            raise self._create_error
+        self.created_indices.append({"index": index, "body": body})
+        self._index_exists = True
+
+    async def get_mapping(self, index):
+        return self._mapping
+
+
+class _FakeElasticsearchClient:
+    """Minimal fake for AsyncElasticsearch to keep tests offline."""
+
+    def __init__(
+        self,
+        *,
+        index_exists: bool = False,
+        mapping: dict = None,
+        search_hits: list = None,
+        mget_docs: list = None,
+        delete_by_query_deleted: int = 0,
+        bulk_success: int = 0,
+        search_error=None,
+    ):
+        self.indices = _FakeElasticsearchIndices(
+            index_exists=index_exists,
+            mapping=mapping or {},
+        )
+        self._search_hits = search_hits or []
+        self._mget_docs = mget_docs or []
+        self._delete_by_query_deleted = delete_by_query_deleted
+        self._bulk_success = bulk_success
+        self._search_error = search_error
+
+        self.search_calls = []
+        self.mget_calls = []
+        self.delete_by_query_calls = []
+        self.bulk_actions_received = []
+        self.closed = False
+
+    async def search(self, index, body):
+        self.search_calls.append({"index": index, "body": body})
+        if self._search_error is not None:
+            raise self._search_error
+        return {"hits": {"hits": self._search_hits}}
+
+    async def mget(self, index, body):
+        self.mget_calls.append({"index": index, "body": body})
+        return {"docs": self._mget_docs}
+
+    async def delete_by_query(self, index, body, refresh=False):
+        self.delete_by_query_calls.append({"index": index, "body": body})
+        return {"deleted": self._delete_by_query_deleted}
+
+    async def close(self):
+        self.closed = True
+
+
+class ElasticsearchVectorStoreTests(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for ElasticsearchVectorStore.
+
+    All Elasticsearch I/O is replaced with fakes so the tests remain
+    offline and dependency-free.
+    """
+
+    def _build_store(self, embedding_model=None, *, es_client=None, index_exists=False):
+        model = embedding_model or _FakeEmbeddingModel()
+        client = es_client or _FakeElasticsearchClient(index_exists=index_exists)
+        from syndicate.vectorstores.elasticsearch import ElasticsearchVectorStore
+
+        store = ElasticsearchVectorStore(
+            es_client=client,
+            index_name="test_index",
+            embedding_model=model,
+            dims=2,
+        )
+        return store, model, client
+
+    # ------------------------------------------------------------------
+    # Constructor validation
+    # ------------------------------------------------------------------
+
+    def test_constructor_warns_when_store_dims_override_model_dims(self):
+        from syndicate.vectorstores.elasticsearch import ElasticsearchVectorStore
+
+        model = _FakeEmbeddingModel(default_dimension=2, supports_dimension_override=True)
+        client = _FakeElasticsearchClient()
+
+        with self.assertWarns(RuntimeWarning):
+            store = ElasticsearchVectorStore(
+                es_client=client,
+                index_name="test_index",
+                embedding_model=model,
+                dims=4,
+            )
+
+        self.assertEqual(store.effective_dimension, 4)
+        self.assertEqual(model.embedding_dimension, 4)
+        self.assertEqual(store.dimension_source, "vector_store")
+
+    def test_constructor_fails_on_fixed_dimension_mismatch(self):
+        from syndicate.vectorstores.elasticsearch import ElasticsearchVectorStore
+
+        model = _FakeEmbeddingModel(default_dimension=2, supports_dimension_override=False)
+
+        with self.assertRaises(ValueError) as ctx:
+            ElasticsearchVectorStore(
+                es_client=_FakeElasticsearchClient(),
+                index_name="test_index",
+                embedding_model=model,
+                dims=4,
+            )
+
+        self.assertIn("fixed dimension", str(ctx.exception))
+
+    def test_constructor_requires_query_and_document_modes(self):
+        from syndicate.vectorstores.elasticsearch import ElasticsearchVectorStore
+
+        model = _FakeEmbeddingModel(supported_modes={"document"})
+
+        with self.assertRaises(ValueError) as ctx:
+            ElasticsearchVectorStore(
+                es_client=_FakeElasticsearchClient(),
+                index_name="test_index",
+                embedding_model=model,
+            )
+
+        self.assertIn("missing required modes", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # Index lifecycle
+    # ------------------------------------------------------------------
+
+    async def test_ensure_index_ready_creates_index_when_missing(self):
+        store, _, client = self._build_store(index_exists=False)
+
+        await store.ensure_index_ready()
+
+        self.assertEqual(len(client.indices.created_indices), 1)
+        created = client.indices.created_indices[0]
+        self.assertEqual(created["index"], "test_index")
+        mapping_props = created["body"]["mappings"]["properties"]
+        self.assertIn("text", mapping_props)
+        self.assertIn("embedding", mapping_props)
+        self.assertIn("metadata", mapping_props)
+        self.assertEqual(mapping_props["embedding"]["dims"], 2)
+        self.assertTrue(store._index_ready)
+
+    async def test_ensure_index_ready_skips_creation_when_index_exists(self):
+        store, _, client = self._build_store(index_exists=True)
+
+        await store.ensure_index_ready()
+
+        self.assertEqual(len(client.indices.created_indices), 0)
+        self.assertTrue(store._index_ready)
+
+    async def test_ensure_index_ready_is_idempotent(self):
+        store, _, client = self._build_store(index_exists=True)
+
+        await store.ensure_index_ready()
+        await store.ensure_index_ready()
+
+        # indices.exists should only be consulted once (cached via _index_ready)
+        self.assertTrue(store._index_ready)
+
+    async def test_validate_backend_configuration_raises_on_dimension_mismatch(self):
+        mapping = {
+            "test_index": {
+                "mappings": {
+                    "properties": {
+                        "embedding": {"type": "dense_vector", "dims": 512}
+                    }
+                }
+            }
+        }
+        store, _, _ = self._build_store(
+            es_client=_FakeElasticsearchClient(index_exists=True, mapping=mapping)
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            await store.validate_backend_configuration()
+
+        self.assertIn("dimension mismatch", str(ctx.exception))
+        self.assertIn("512", str(ctx.exception))
+
+    async def test_validate_backend_configuration_passes_on_matching_dimensions(self):
+        mapping = {
+            "test_index": {
+                "mappings": {
+                    "properties": {
+                        "embedding": {"type": "dense_vector", "dims": 2}
+                    }
+                }
+            }
+        }
+        store, _, _ = self._build_store(
+            es_client=_FakeElasticsearchClient(index_exists=True, mapping=mapping)
+        )
+
+        # Should not raise
+        await store.validate_backend_configuration()
+
+    async def test_validate_backend_configuration_skips_gracefully_when_index_missing(self):
+        from elasticsearch import NotFoundError
+
+        client = _FakeElasticsearchClient(index_exists=True)
+        client.indices._mapping = {}
+
+        async def _raise(*args, **kwargs):
+            raise NotFoundError("", meta=None, body={})  # type: ignore[arg-type]
+
+        client.indices.get_mapping = _raise  # type: ignore[method-assign]
+        store, _, _ = self._build_store(es_client=client)
+
+        # Should not raise
+        await store.validate_backend_configuration()
+
+    # ------------------------------------------------------------------
+    # search — routing
+    # ------------------------------------------------------------------
+
+    async def test_search_defaults_to_hybrid_and_embeds_query(self):
+        store, model, _ = self._build_store()
+        store._hybrid_search = AsyncMock(return_value=[{"id": "h1"}])
+        store._vector_search = AsyncMock(return_value=[{"id": "v1"}])
+
+        result = await store.search("vacation days", k=3, filter={"dept": "hr"})
+
+        self.assertEqual(result, [{"id": "h1"}])
+        self.assertEqual(model.embed_calls, ["vacation days"])
+        store._hybrid_search.assert_awaited_once_with(
+            [0.1, 0.2], "vacation days", 3, {"dept": "hr"}
+        )
+        store._vector_search.assert_not_awaited()
+
+    async def test_search_vector_only_path(self):
+        store, model, _ = self._build_store()
+        store._hybrid_search = AsyncMock(return_value=[{"id": "h1"}])
+        store._vector_search = AsyncMock(return_value=[{"id": "v1"}])
+
+        result = await store.search("benefits", k=2, use_hybrid=False)
+
+        self.assertEqual(result, [{"id": "v1"}])
+        self.assertEqual(model.embed_calls, ["benefits"])
+        store._vector_search.assert_awaited_once_with([0.1, 0.2], 2, None)
+        store._hybrid_search.assert_not_awaited()
+
+    async def test_search_rejects_query_dimension_mismatch(self):
+        model = _FakeEmbeddingModel(query_embedding=[0.9])  # dim=1, store expects 2
+        store, _, _ = self._build_store(embedding_model=model)
+
+        with self.assertRaises(ValueError) as ctx:
+            await store.search("anything")
+
+        self.assertIn("Query embedding dimension mismatch", str(ctx.exception))
+
+    async def test_search_realigns_embedding_dimension_after_external_drift(self):
+        class _DynamicModel(_FakeEmbeddingModel):
+            async def embed(self, text, mode="document"):
+                self.embed_calls.append(text)
+                return [float(i) for i in range(self.embedding_dimension)]
+
+        model = _DynamicModel(default_dimension=2, supports_dimension_override=True)
+        store, _, _ = self._build_store(embedding_model=model)
+        store._hybrid_search = AsyncMock(return_value=[{"id": "x"}])
+
+        # External drift: another component reconfigured the shared model
+        model.configure_dimension(4, source="external")
+
+        await store.search("hi")
+
+        # Store must have re-aligned the model back to 2
+        self.assertEqual(model.embedding_dimension, 2)
+        self.assertEqual(model.dimension_source, "vector_store")
+        store._hybrid_search.assert_awaited_once_with([0.0, 1.0], "hi", 4, None)
+
+    # ------------------------------------------------------------------
+    # _vector_search
+    # ------------------------------------------------------------------
+
+    async def test_vector_search_sends_correct_knn_body(self):
+        hits = [
+            {"_id": "doc-1", "_score": 0.95, "_source": {"text": "hello", "metadata": {"src": "a"}}},
+            {"_id": "doc-2", "_score": 0.80, "_source": {"text": "world", "metadata": {}}},
+        ]
+        client = _FakeElasticsearchClient(index_exists=True, search_hits=hits)
+        store, _, _ = self._build_store(es_client=client)
+
+        results = await store._vector_search([0.1, 0.2], k=2)
+
+        self.assertEqual(len(client.search_calls), 1)
+        body = client.search_calls[0]["body"]
+        self.assertIn("knn", body)
+        knn = body["knn"]
+        self.assertEqual(knn["field"], "embedding")
+        self.assertEqual(knn["query_vector"], [0.1, 0.2])
+        self.assertEqual(knn["k"], 2)
+        self.assertGreaterEqual(knn["num_candidates"], 20)
+        self.assertNotIn("filter", knn)
+        self.assertEqual(results[0]["id"], "doc-1")
+        self.assertAlmostEqual(results[0]["score"], 0.95)
+        self.assertEqual(results[1]["id"], "doc-2")
+
+    async def test_vector_search_includes_metadata_filter(self):
+        client = _FakeElasticsearchClient(index_exists=True, search_hits=[])
+        store, _, _ = self._build_store(es_client=client)
+
+        await store._vector_search([0.1, 0.2], k=3, filter={"category": "tech"})
+
+        knn = client.search_calls[0]["body"]["knn"]
+        self.assertIn("filter", knn)
+        self.assertEqual(knn["filter"], {"term": {"metadata.category": "tech"}})
+
+    async def test_vector_search_multi_key_filter_uses_bool(self):
+        client = _FakeElasticsearchClient(index_exists=True, search_hits=[])
+        store, _, _ = self._build_store(es_client=client)
+
+        await store._vector_search([0.1, 0.2], k=2, filter={"a": 1, "b": 2})
+
+        knn_filter = client.search_calls[0]["body"]["knn"]["filter"]
+        self.assertIn("bool", knn_filter)
+        self.assertEqual(len(knn_filter["bool"]["filter"]), 2)
+
+    # ------------------------------------------------------------------
+    # _hybrid_search
+    # ------------------------------------------------------------------
+
+    async def test_hybrid_search_sends_rrf_body(self):
+        hits = [{"_id": "rrf-1", "_score": 1.0, "_source": {"text": "rrf result", "metadata": {}}}]
+        client = _FakeElasticsearchClient(index_exists=True, search_hits=hits)
+        store, _, _ = self._build_store(es_client=client)
+
+        results = await store._hybrid_search([0.1, 0.2], "query text", k=1)
+
+        self.assertEqual(len(client.search_calls), 1)
+        body = client.search_calls[0]["body"]
+        self.assertIn("knn", body)
+        self.assertIn("query", body)
+        self.assertIn("rank", body)
+        self.assertIn("rrf", body["rank"])
+        self.assertEqual(body["query"], {"match": {"text": {"query": "query text"}}})
+        self.assertEqual(results[0]["id"], "rrf-1")
+
+    async def test_hybrid_search_wraps_bm25_with_filter(self):
+        client = _FakeElasticsearchClient(index_exists=True, search_hits=[])
+        store, _, _ = self._build_store(es_client=client)
+
+        await store._hybrid_search([0.1, 0.2], "query", k=2, filter={"dept": "eng"})
+
+        body = client.search_calls[0]["body"]
+        text_query = body["query"]
+        # Must wrap the match inside a bool+filter
+        self.assertIn("bool", text_query)
+        self.assertIn("must", text_query["bool"])
+        self.assertIn("filter", text_query["bool"])
+
+    async def test_hybrid_search_falls_back_to_knn_on_error(self):
+        class _ErrorAfterFirstCall:
+            """Raises on first search call (hybrid), succeeds on second (kNN fallback)."""
+
+            def __init__(self):
+                self.call_count = 0
+                self.indices = _FakeElasticsearchIndices(index_exists=True)
+                self.closed = False
+
+            async def search(self, index, body):
+                self.call_count += 1
+                if self.call_count == 1:
+                    raise RuntimeError("rrf unavailable")
+                # Second call: kNN-only fallback
+                return {"hits": {"hits": [
+                    {"_id": "knn-1", "_score": 0.7,
+                     "_source": {"text": "fallback", "metadata": {}}}
+                ]}}
+
+            async def close(self):
+                self.closed = True
+
+        client = _ErrorAfterFirstCall()
+        store, _, _ = self._build_store(es_client=client)
+
+        results = await store._hybrid_search([0.1, 0.2], "query", k=1)
+
+        self.assertEqual(client.call_count, 2)
+        self.assertEqual(results[0]["id"], "knn-1")
+
+    # ------------------------------------------------------------------
+    # add_texts / add_documents
+    # ------------------------------------------------------------------
+
+    async def test_add_texts_indexes_documents_and_returns_ids(self):
+        model = _FakeEmbeddingModel(batch_embeddings=[[0.1, 0.2], [0.3, 0.4]])
+
+        # Capture the actions passed to async_bulk
+        captured_actions = []
+
+        async def _fake_bulk(client, actions, refresh=None, raise_on_error=True):
+            captured_actions.extend(list(actions))
+            return len(captured_actions), []
+
+        store, _, _ = self._build_store(embedding_model=model)
+
+        import unittest.mock as mock
+        import syndicate.vectorstores.elasticsearch as es_module
+
+        with mock.patch.object(es_module, "async_bulk", side_effect=_fake_bulk):
+            ids = await store.add_texts(
+                texts=["Doc A", "Doc B"],
+                metadatas=[{"tag": "x"}, {"tag": "y"}],
+                ids=["id-a", "id-b"],
+            )
+
+        self.assertEqual(ids, ["id-a", "id-b"])
+        self.assertEqual(model.embed_batch_calls, [["Doc A", "Doc B"]])
+        self.assertEqual(len(captured_actions), 2)
+        self.assertEqual(captured_actions[0]["_id"], "id-a")
+        self.assertEqual(captured_actions[0]["_source"]["text"], "Doc A")
+        self.assertEqual(captured_actions[0]["_source"]["embedding"], [0.1, 0.2])
+        self.assertEqual(captured_actions[0]["_source"]["metadata"], {"tag": "x"})
+        self.assertEqual(captured_actions[1]["_id"], "id-b")
+
+    async def test_add_texts_generates_ids_when_omitted(self):
+        model = _FakeEmbeddingModel(batch_embeddings=[[0.1, 0.2]])
+        captured_actions = []
+
+        async def _fake_bulk(client, actions, refresh=None, raise_on_error=True):
+            captured_actions.extend(list(actions))
+            return 1, []
+
+        store, _, _ = self._build_store(embedding_model=model)
+
+        import unittest.mock as mock
+        import syndicate.vectorstores.elasticsearch as es_module
+
+        with mock.patch.object(es_module, "async_bulk", side_effect=_fake_bulk):
+            ids = await store.add_texts(texts=["Doc"])
+
+        self.assertEqual(len(ids), 1)
+        self.assertIsInstance(ids[0], str)
+        self.assertEqual(captured_actions[0]["_id"], ids[0])
+
+    async def test_add_texts_rejects_document_dimension_mismatch(self):
+        model = _FakeEmbeddingModel(batch_embeddings=[[0.9]])  # dim=1, store expects 2
+        store, _, _ = self._build_store(embedding_model=model)
+
+        with self.assertRaises(ValueError) as ctx:
+            await store.add_texts(texts=["Doc"])
+
+        self.assertIn("Document embedding dimension mismatch", str(ctx.exception))
+
+    async def test_add_documents_delegates_to_add_texts(self):
+        store, _, _ = self._build_store()
+        store.add_texts = AsyncMock(return_value=["doc-1"])
+
+        ids = await store.add_documents([
+            {"content": "Hello world", "metadata": {"src": "file.txt"}, "id": "doc-1"}
+        ])
+
+        self.assertEqual(ids, ["doc-1"])
+        store.add_texts.assert_awaited_once_with(
+            ["Hello world"],
+            [{"src": "file.txt"}],
+            ["doc-1"],
+        )
+
+    async def test_add_documents_auto_generates_ids_when_any_missing(self):
+        store, _, _ = self._build_store()
+        store.add_texts = AsyncMock(return_value=["gen-1", "gen-2"])
+
+        # Second doc has no id → all IDs should be auto-generated
+        await store.add_documents([
+            {"content": "A", "id": "explicit"},
+            {"content": "B"},
+        ])
+
+        _, _, passed_ids = store.add_texts.call_args.args
+        self.assertIsNone(passed_ids)
+
+    async def test_add_documents_raises_on_empty_list(self):
+        store, _, _ = self._build_store()
+
+        with self.assertRaises(ValueError):
+            await store.add_documents([])
+
+    # ------------------------------------------------------------------
+    # delete
+    # ------------------------------------------------------------------
+
+    async def test_delete_all_uses_delete_by_query(self):
+        client = _FakeElasticsearchClient(index_exists=True, delete_by_query_deleted=5)
+        store, _, _ = self._build_store(es_client=client)
+
+        count = await store.delete()
+
+        self.assertEqual(count, 5)
+        self.assertEqual(len(client.delete_by_query_calls), 1)
+        self.assertEqual(client.delete_by_query_calls[0]["body"]["query"], {"match_all": {}})
+
+    async def test_delete_by_ids_uses_bulk_delete(self):
+        bulk_calls = []
+
+        async def _fake_bulk(client, actions, refresh=None, raise_on_error=True):
+            bulk_calls.extend(list(actions))
+            return 2, []
+
+        store, _, _ = self._build_store()
+
+        import unittest.mock as mock
+        import syndicate.vectorstores.elasticsearch as es_module
+
+        with mock.patch.object(es_module, "async_bulk", side_effect=_fake_bulk):
+            count = await store.delete(ids=["id-1", "id-2"])
+
+        self.assertEqual(count, 2)
+        op_types = {a["_op_type"] for a in bulk_calls}
+        self.assertEqual(op_types, {"delete"})
+        deleted_ids = {a["_id"] for a in bulk_calls}
+        self.assertEqual(deleted_ids, {"id-1", "id-2"})
+
+    # ------------------------------------------------------------------
+    # get_by_ids
+    # ------------------------------------------------------------------
+
+    async def test_get_by_ids_returns_found_documents(self):
+        mget_docs = [
+            {"_id": "id-1", "found": True, "_source": {"text": "Doc 1", "metadata": {"k": "v"}}},
+            {"_id": "id-2", "found": False},
+        ]
+        client = _FakeElasticsearchClient(index_exists=True, mget_docs=mget_docs)
+        store, _, _ = self._build_store(es_client=client)
+
+        results = await store.get_by_ids(["id-1", "id-2"])
+
+        # Only the found document should be in results
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], "id-1")
+        self.assertEqual(results[0]["text"], "Doc 1")
+        self.assertEqual(results[0]["metadata"], {"k": "v"})
+
+    async def test_get_by_ids_returns_empty_for_empty_input(self):
+        store, _, _ = self._build_store()
+
+        results = await store.get_by_ids([])
+
+        self.assertEqual(results, [])
+
+    # ------------------------------------------------------------------
+    # close
+    # ------------------------------------------------------------------
+
+    async def test_close_closes_es_client_and_embedding_model(self):
+        store, model, client = self._build_store()
+
+        await store.close()
+
+        self.assertTrue(client.closed)
+        self.assertTrue(model.closed)
+
+    async def test_close_is_safe_to_call_multiple_times(self):
+        store, _, client = self._build_store()
+
+        await store.close()
+        await store.close()
+
+        # Should not raise even after the client is already closed
+        self.assertTrue(client.closed)
+
+    # ------------------------------------------------------------------
+    # auto_setup integration
+    # ------------------------------------------------------------------
+
+    async def test_auto_setup_triggers_ensure_index_ready_before_search(self):
+        from syndicate.vectorstores.elasticsearch import ElasticsearchVectorStore
+
+        model = _FakeEmbeddingModel()
+        client = _FakeElasticsearchClient(index_exists=False, search_hits=[])
+        store = ElasticsearchVectorStore(
+            es_client=client,
+            index_name="auto_index",
+            embedding_model=model,
+            auto_setup=True,
+        )
+        store._hybrid_search = AsyncMock(return_value=[])
+
+        await store.search("hello")
+
+        # Index must have been created as part of auto-setup
+        self.assertEqual(len(client.indices.created_indices), 1)
+        self.assertTrue(store._index_ready)
+
+    async def test_auto_setup_triggers_ensure_index_ready_before_add_texts(self):
+        from syndicate.vectorstores.elasticsearch import ElasticsearchVectorStore
+
+        model = _FakeEmbeddingModel(batch_embeddings=[[0.1, 0.2]])
+        client = _FakeElasticsearchClient(index_exists=False)
+
+        store = ElasticsearchVectorStore(
+            es_client=client,
+            index_name="auto_index",
+            embedding_model=model,
+            auto_setup=True,
+        )
+
+        import unittest.mock as mock
+        import syndicate.vectorstores.elasticsearch as es_module
+
+        with mock.patch.object(es_module, "async_bulk", return_value=(1, [])):
+            await store.add_texts(["Doc"])
+
+        self.assertEqual(len(client.indices.created_indices), 1)
+
+    # ------------------------------------------------------------------
+    # _build_metadata_filter
+    # ------------------------------------------------------------------
+
+    def test_build_metadata_filter_single_key(self):
+        store, _, _ = self._build_store()
+
+        result = store._build_metadata_filter({"category": "tech"})
+
+        self.assertEqual(result, {"term": {"metadata.category": "tech"}})
+
+    def test_build_metadata_filter_multi_key_uses_bool(self):
+        store, _, _ = self._build_store()
+
+        result = store._build_metadata_filter({"a": 1, "b": 2})
+
+        self.assertIn("bool", result)
+        self.assertEqual(len(result["bool"]["filter"]), 2)
+
+    def test_build_metadata_filter_empty_returns_match_all(self):
+        store, _, _ = self._build_store()
+
+        result = store._build_metadata_filter({})
+
+        self.assertEqual(result, {"match_all": {}})
+
+    # ------------------------------------------------------------------
+    # _format_hits
+    # ------------------------------------------------------------------
+
+    def test_format_hits_maps_fields_correctly(self):
+        store, _, _ = self._build_store()
+
+        hits = [
+            {"_id": "doc-1", "_score": 0.9, "_source": {"text": "hello", "metadata": {"k": "v"}}},
+            {"_id": "doc-2", "_source": {"text": "world", "metadata": None}},
+        ]
+        results = store._format_hits(hits)
+
+        self.assertEqual(results[0], {"id": "doc-1", "text": "hello", "metadata": {"k": "v"}, "score": 0.9})
+        self.assertEqual(results[1]["id"], "doc-2")
+        self.assertEqual(results[1]["metadata"], {})
+        self.assertNotIn("score", results[1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

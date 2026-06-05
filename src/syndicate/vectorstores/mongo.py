@@ -719,7 +719,16 @@ class MongoVectorStore(BaseVectorStore):
             raise
         
         return ids
-    
+
+    async def add_documents(
+        self,
+        documents: List[Dict[str, Any]]
+    ) -> List[str]:
+        """Add documents with explicit text, metadata, and optional IDs.     
+        """
+        pass # This method can be implemented similarly to add_texts, but expects pre-structured document dicts with 'text', 'metadata', and optional 'id' fields.
+
+
     async def delete(self, ids: Optional[List[str]] = None) -> int:
         """
         Delete documents from the vector store.

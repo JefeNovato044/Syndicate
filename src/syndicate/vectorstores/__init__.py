@@ -40,13 +40,18 @@ from .mongo import (
     MongoVectorStore
 )
 
+from .elasticsearch import (
+    ElasticsearchVectorStore
+)
+
 __all__ = [
     # Base classes
     "BaseVectorStore",
-    
+
     # Implementations
     "MongoVectorStore",
-    
+    "ElasticsearchVectorStore",
+
     # Utilities
     "reciprocal_rank_fusion"
 ]

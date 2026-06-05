@@ -155,6 +155,28 @@ class BaseVectorStore(ABC):
             ```
         """
         pass
+
+    @abstractmethod
+    async def add_documents(self, documents: List[Dict[str, Any]]) -> List[str]:
+        """
+        Will replace add_texts in the future - accepts list of dicts with 'content',
+        Add documents to the vector store using a list of dicts.
+        
+        Each document dict should have at least a 'content' key for the text,
+        and can optionally include 'metadata' and 'id' keys. The vector store
+        will automatically generate embeddings from the 'content' field.
+        
+        Args:
+            documents: List of document dicts with the following structure:
+                       [
+                           {
+                               "content": "document text",  # REQUIRED
+                               "metadata": {"key": "value"},  # Optional
+                               "id": "custom-doc-id"  # Optional
+                           },
+                           ...
+            """
+        pass         
     
     @abstractmethod
     async def delete(self, ids: Optional[List[str]] = None) -> int:

@@ -41,12 +41,10 @@ from typing import Any, Dict, List, Optional
 try:
     from elasticsearch import AsyncElasticsearch, NotFoundError
     from elasticsearch.helpers import async_bulk
-except ImportError as _es_import_error:  # noqa: F841
-    raise ImportError(
-        "The 'elasticsearch' package is required to use ElasticsearchVectorStore. "
-        "Install it with: pip install 'syndicate[elasticsearch]' "
-        "or: pip install 'elasticsearch[async]>=9.4.1'"
-    ) from None
+except ImportError:
+    AsyncElasticsearch = None  # type: ignore[assignment,misc]
+    NotFoundError = None  # type: ignore[assignment,misc]
+    async_bulk = None  # type: ignore[assignment]
 
 from .base import BaseVectorStore
 from ..ingestion.embedding_models import EmbeddingModel, EmbeddingMode
@@ -107,6 +105,12 @@ class ElasticsearchVectorStore(BaseVectorStore):
                         Set to ``False`` when you manage the index lifecycle
                         externally or via :meth:`ensure_index_ready`.
         """
+        if AsyncElasticsearch is None:
+            raise ImportError(
+                "The 'elasticsearch' package is required to use ElasticsearchVectorStore. "
+                "Install it with: pip install 'syndicate[elasticsearch]' "
+                "or: pip install 'elasticsearch[async]>=9.4.1'"
+            )
         super().__init__(embedding_model=embedding_model)
         self.es_client = es_client
         self.index_name = index_name

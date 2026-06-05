@@ -40,9 +40,11 @@ from .mongo import (
     MongoVectorStore
 )
 
-from .elasticsearch import (
-    ElasticsearchVectorStore
-)
+try:
+    from .elasticsearch import ElasticsearchVectorStore
+    _elasticsearch_available = True
+except ImportError:
+    _elasticsearch_available = False
 
 __all__ = [
     # Base classes
@@ -50,8 +52,10 @@ __all__ = [
 
     # Implementations
     "MongoVectorStore",
-    "ElasticsearchVectorStore",
 
     # Utilities
     "reciprocal_rank_fusion"
 ]
+
+if _elasticsearch_available:
+    __all__.append("ElasticsearchVectorStore")

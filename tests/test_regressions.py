@@ -1384,6 +1384,133 @@ class AgentRegenerateTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await agent.regenerate_response(owner_id="owner", chat_id="chat")
 
+    async def test_regenerate_mode_message_explicit_same_as_default(self):
+        """mode='message' leaves tool messages intact and only replays the final answer."""
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        # Simulate a stored tool-call turn: ai (tool_calls) → tool → ai (answer)
+        await memory.add_message(Message(role="ai", content="", tool_calls=[ToolCall(id="tc1", name="weather", arguments={})]), "owner", "chat")
+        await memory.add_message(Message(role="tool", content='{"result": "sunny"}', tool_call_id="tc1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="old final answer"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        response = await agent.regenerate_response(owner_id="owner", chat_id="chat", mode="message")
+        self.assertEqual(response.content, "regenerated answer")
+
+        history = await memory.get_history("owner", "chat")
+        roles = [m.role for m in history]
+        # Tool messages must still be present; only final ai answer is replaced.
+        self.assertEqual(roles, ["human", "ai", "tool", "ai"])
+        self.assertEqual(history[-1].content, "regenerated answer")
+
+    async def test_regenerate_mode_turn_removes_entire_tool_chain(self):
+        """mode='turn' walks back to the ai message that started the tool chain."""
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        # Simulate stored turn: ai (tool_calls) → tool → ai (answer)
+        await memory.add_message(Message(role="ai", content="", tool_calls=[ToolCall(id="tc1", name="weather", arguments={})]), "owner", "chat")
+        await memory.add_message(Message(role="tool", content='{"result": "sunny"}', tool_call_id="tc1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="old final answer"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        response = await agent.regenerate_response(owner_id="owner", chat_id="chat", mode="turn")
+        self.assertEqual(response.content, "regenerated answer")
+
+        history = await memory.get_history("owner", "chat")
+        roles = [m.role for m in history]
+        # Entire tool chain (ai+tool+ai) must be gone; only human + new ai remain.
+        self.assertEqual(roles, ["human", "ai"])
+        self.assertEqual(history[-1].content, "regenerated answer")
+
+    async def test_regenerate_mode_turn_no_tool_chain_same_as_message(self):
+        """mode='turn' without a preceding tool chain behaves like mode='message'."""
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="old answer"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        response = await agent.regenerate_response(owner_id="owner", chat_id="chat", mode="turn")
+        self.assertEqual(response.content, "regenerated answer")
+
+        history = await memory.get_history("owner", "chat")
+        self.assertEqual([m.role for m in history], ["human", "ai"])
+        self.assertEqual(history[-1].content, "regenerated answer")
+
+    async def test_regenerate_invalid_mode_raises(self):
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="a1"), "owner", "chat")
+
+        agent = BaseAgent(
+            llm_client=_FakeRegenerateClient(),
+            memory=memory,
+            system_prompt="system",
+        )
+
+        with self.assertRaises(ValueError):
+            await agent.regenerate_response(owner_id="owner", chat_id="chat", mode="full_replay")
+
+    async def test_regenerate_turn_mode_surfaces_tool_calls_in_response(self):
+        """tool_calls fired during a mode='turn' replay must be returned in ChatResponse."""
+        memory = LocalMemory()
+        await memory.add_message(Message(role="human", content="u1"), "owner", "chat")
+        await memory.add_message(Message(role="ai", content="old answer"), "owner", "chat")
+
+        # Client that fires one tool call on the first LLM call, then returns
+        # a plain answer on the second (simulating a single-tool agentic turn).
+        call_count = {"n": 0}
+
+        class _ToolCallingClient:
+            provider_type = "openai"
+            model_name = "fake-tool-model"
+
+            async def chat_completion_async(self, messages, system_message, tools=None, **kwargs):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    return ChatResponse(
+                        content="",
+                        tool_calls=[ToolCall(id="tc42", name="lookup", arguments={"q": "x"})],
+                    )
+                return ChatResponse(content="regenerated with tools")
+
+        class _LookupTool:
+            name = "lookup"
+            description = "lookup tool"
+
+            async def run_async(self, q):
+                return {"found": q}
+
+            def to_format(self, provider):
+                return {"type": "function", "function": {"name": "lookup"}}
+
+        agent = BaseAgent(
+            llm_client=_ToolCallingClient(),
+            memory=memory,
+            system_prompt="system",
+            tools=[_LookupTool()],
+        )
+
+        response = await agent.regenerate_response(owner_id="owner", chat_id="chat", mode="turn")
+        self.assertEqual(response.content, "regenerated with tools")
+        self.assertIsNotNone(response.tool_calls)
+        self.assertEqual(len(response.tool_calls), 1)
+        self.assertEqual(response.tool_calls[0].name, "lookup")
+
 
 class AgentFullHistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_agent_get_full_history_delegates_to_memory(self):

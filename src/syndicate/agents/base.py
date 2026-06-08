@@ -820,8 +820,18 @@ class BaseAgent(ABC):
                 new_messages = [Message(role="ai", content=str(regenerated_text))]
             await self._store_interaction(new_messages, owner_id, chat_id)
 
+            all_tool_calls = [
+                tc
+                for msg in new_messages
+                if msg.role == "ai" and msg.tool_calls
+                for tc in msg.tool_calls
+            ]
+
             request_succeeded = True
-            return ChatResponse(content=str(regenerated_text))
+            return ChatResponse(
+                content=str(regenerated_text),
+                tool_calls=all_tool_calls if all_tool_calls else None,
+            )
         except asyncio.CancelledError as exc:
             if emit_observers:
                 await self._emit_observer_error(

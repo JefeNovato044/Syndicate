@@ -705,15 +705,28 @@ class BaseAgent(ABC):
         owner_id: str = "default",
         chat_id: str = "default",
         target_index: Optional[int] = None,
+        mode: str = "message",
         **kwargs,
     ) -> ChatResponse:
         """Regenerate an AI response by truncating active history and replaying.
+
+        Args:
+            mode: Truncation scope.
+                - ``"message"`` (default): truncates only the final AI answer and
+                  replays from the existing tool results.  Tool calls are NOT
+                  re-executed.
+                - ``"turn"``: truncates the entire AI turn — the initiating AI
+                  tool-call message, all intermediate tool/result messages, and
+                  the final answer — then replays the full agentic loop including
+                  fresh tool executions.
 
         Behavior:
         - Operates on active bucket history only.
         - Uses hard delete during truncation for deterministic replay.
         - Returns ChatResponse for API consistency with client models.
         """
+        if mode not in ("message", "turn"):
+            raise ValueError(f"Invalid mode '{mode}': must be 'message' or 'turn'")
         if self.memory is None:
             raise ValueError("regenerate_response requires a configured memory backend")
         if not hasattr(self.memory, "get_history") or not hasattr(self.memory, "delete_message"):
@@ -761,13 +774,30 @@ class BaseAgent(ABC):
             if ai_index is None:
                 raise ValueError("No AI message found to regenerate.")
 
-            # Truncate from selected AI turn to the end of active visible history.
-            delete_count = len(history) - ai_index
+            # Determine where to start truncation based on mode.
+            if mode == "turn":
+                # Walk backwards from ai_index to find the first ai message of
+                # this turn (the one that initiated the tool-call chain, if any).
+                # Consecutive "ai" and "tool" messages belong to the same turn;
+                # stop at the first "human" or other boundary.
+                truncate_from = ai_index
+                for i in range(ai_index - 1, -1, -1):
+                    if history[i].role in ("ai", "tool"):
+                        if history[i].role == "ai":
+                            truncate_from = i
+                    else:
+                        break
+            else:
+                # "message" mode: only delete the final AI answer.
+                truncate_from = ai_index
+
+            # Truncate from selected point to the end of active visible history.
+            delete_count = len(history) - truncate_from
             for _ in range(delete_count):
                 deleted = await self.memory.delete_message(
                     owner_id=owner_id,
                     chat_id=chat_id,
-                    index=ai_index,
+                    index=truncate_from,
                     hard_delete=True,
                 )
                 if not deleted:

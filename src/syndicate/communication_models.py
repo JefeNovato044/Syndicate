@@ -4,6 +4,35 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Literal, Optional, List, Any, Dict
 from datetime import datetime, timezone
 
+
+class File(BaseModel):
+    """A file to be sent inline with a request (bytes serialized in the payload).
+
+    Use for files ≤100 MB (≤50 MB for PDFs). The data is re-sent with every
+    request, so prefer provider-specific upload methods (e.g.
+    ``GeminiClient.upload_file()``) for large or frequently reused files.
+
+    Attributes:
+        data: Raw file content.
+        mime_type: MIME type (e.g. ``"application/pdf"``, ``"audio/mp3"``).
+        name: Optional display name (used by some providers for logging/UI).
+    """
+
+    data: bytes = Field(..., description="Raw file bytes.")
+    mime_type: str = Field(..., description="MIME type of the file.")
+    name: Optional[str] = Field(None, description="Optional display name.")
+
+    @field_validator('data', mode='before')
+    @classmethod
+    def require_bytes(cls, v: object) -> object:
+        if not isinstance(v, (bytes, bytearray)):
+            raise ValueError(
+                f"File.data must be bytes or bytearray, got {type(v).__name__}. "
+                "Read the file with open(..., 'rb') or pathlib.Path(...).read_bytes()."
+            )
+        return v
+
+
 class ToolCall(BaseModel):
     """Represents a tool/function call from the LLM."""
     id: str = Field(..., description="Unique identifier for this tool call")

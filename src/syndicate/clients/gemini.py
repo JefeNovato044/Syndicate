@@ -1,18 +1,48 @@
 """Gemini LLM client for Google's Gemini API."""
 
+import io
 import json
 import logging
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 from collections.abc import AsyncGenerator
 
 from google import genai
 from google.genai import types
 from google.oauth2 import service_account
 
-from ..communication_models import Message, ChatResponse, ToolCall, StreamChunk
+from ..communication_models import Message, ChatResponse, ToolCall, StreamChunk, File
 from .base import Client
 
 logger = logging.getLogger(__name__)
+
+
+class UploadedFile:
+    """A reference to a file stored server-side via the Gemini File API.
+
+    Do not construct this directly — it is returned by
+    :meth:`GeminiClient.upload_file` after a successful upload.
+    The ``uri`` is valid for 48 hours after upload.
+
+    Attributes:
+        uri: Gemini-assigned file URI (e.g. ``"files/abc123"``).
+        mime_type: MIME type of the uploaded file.
+        name: Gemini-assigned resource name.
+    """
+
+    __slots__ = ("uri", "mime_type", "name")
+
+    def __init__(self, uri: str, mime_type: str, name: str) -> None:
+        self.uri = uri
+        self.mime_type = mime_type
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"UploadedFile(uri={self.uri!r}, mime_type={self.mime_type!r}, name={self.name!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, UploadedFile):
+            return NotImplemented
+        return self.uri == other.uri and self.mime_type == other.mime_type and self.name == other.name
 
 
 class GeminiClient(Client):
@@ -412,7 +442,61 @@ class GeminiClient(Client):
             result.append(types.Tool(function_declarations=function_declarations))
 
         return result if result else None
-    
+
+    def _resolve_file_part(self, f: "File | UploadedFile") -> Any:
+        """
+        Convert a :class:`File` or :class:`UploadedFile` to a ``types.Part``.
+
+        - :class:`File`         → ``types.Part.from_bytes()`` (inline, re-sent every request)
+        - :class:`UploadedFile` → ``types.Part.from_uri()``   (server-side reference)
+
+        Args:
+            f: A :class:`File` or :class:`UploadedFile` instance.
+
+        Returns:
+            A ``types.Part`` ready for inclusion in a Gemini contents list.
+
+        Raises:
+            TypeError: If the input is not one of the expected types.
+        """
+        if isinstance(f, File):
+            return types.Part.from_bytes(data=f.data, mime_type=f.mime_type)
+
+        if isinstance(f, UploadedFile):
+            return types.Part.from_uri(file_uri=f.uri, mime_type=f.mime_type)
+
+        raise TypeError(
+            f"Expected File or UploadedFile, got {type(f).__name__}."
+        )
+
+    async def upload_file(self, file: File) -> UploadedFile:
+        """
+        Upload a :class:`File` to the Gemini File API (up to 2 GB).
+
+        The file is stored server-side for 48 hours.  The returned
+        :class:`UploadedFile` can be passed in ``files=`` across multiple
+        requests without re-uploading the bytes each time.
+
+        Args:
+            file: A :class:`File` instance containing the raw bytes,
+                MIME type, and optional display name.
+
+        Returns:
+            An :class:`UploadedFile` with the provider-assigned ``uri``,
+            ``mime_type``, and ``name``.
+
+        Example::
+
+            f = File(data=pdf_bytes, mime_type="application/pdf")
+            uploaded = await client.upload_file(f)
+            response = await client.chat_completion_async(messages, files=[uploaded])
+        """
+        config = types.UploadFileConfig(mime_type=file.mime_type, display_name=file.name)
+        raw = await self.client.aio.files.upload(
+            file=io.BytesIO(file.data), config=config
+        )
+        return UploadedFile(uri=raw.uri, mime_type=raw.mime_type, name=raw.name)
+
     async def chat_completion_async(
         self,
         messages: List[Message],
@@ -421,6 +505,7 @@ class GeminiClient(Client):
         tools: Optional[List[Any]] = None,
         thinking_level: Optional[str] = None,
         include_thoughts: Optional[bool] = None,
+        files: Optional[List[Union[File, UploadedFile]]] = None,
         **kwargs
     ) -> ChatResponse:
         """
@@ -433,6 +518,10 @@ class GeminiClient(Client):
             tools: Optional list of tool definitions (BaseTool instances or dicts)
             thinking_level: Optional thinking level for extended thinking ("none", "low", "medium", "high")
             include_thoughts: Optional flag to request thought text in the response
+            files: Optional list of :class:`File` or :class:`UploadedFile` instances
+                to attach to the last user message. Use :class:`File` for inline data
+                (≤100 MB, ≤50 MB PDFs) or :class:`UploadedFile` returned by
+                :meth:`upload_file` for server-side references (up to 2 GB, 48h TTL).
             **kwargs: Additional parameters for Gemini API
             
         Returns:
@@ -445,17 +534,17 @@ class GeminiClient(Client):
         if system_message:
             system_instruction = system_message.content
         
-        # Add image to last user message if provided
-        if image and chat_messages:
-            # Find last user message
+        # Collect extra parts (legacy image + new files) and inject into the last user message
+        _extra_parts: List[Any] = []
+        if image:
+            _extra_parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image}})
+        if files:
+            for f in files:
+                _extra_parts.append(self._resolve_file_part(f))
+        if _extra_parts and chat_messages:
             for msg in reversed(chat_messages):
                 if msg["role"] == "user":
-                    msg["parts"].append({
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image
-                        }
-                    })
+                    msg["parts"].extend(_extra_parts)
                     break
         
         # Format tools if provided
@@ -502,6 +591,7 @@ class GeminiClient(Client):
         tools: Optional[List[Any]] = None,
         thinking_level: Optional[str] = None,
         include_thoughts: Optional[bool] = None,
+        files: Optional[List[Union[File, UploadedFile]]] = None,
         **kwargs
     ) -> AsyncGenerator[StreamChunk, None]:
         """
@@ -514,6 +604,10 @@ class GeminiClient(Client):
             tools: Optional list of tool definitions (BaseTool instances or dicts)
             thinking_level: Optional thinking level for extended thinking ("none", "low", "medium", "high")
             include_thoughts: Optional flag to request thought text in the response
+            files: Optional list of :class:`File` or :class:`UploadedFile` instances
+                to attach to the last user message. Use :class:`File` for inline data
+                (≤100 MB, ≤50 MB PDFs) or :class:`UploadedFile` returned by
+                :meth:`upload_file` for server-side references (up to 2 GB, 48h TTL).
             **kwargs: Additional parameters
             
         Yields:
@@ -526,17 +620,17 @@ class GeminiClient(Client):
         if system_message:
             system_instruction = system_message.content
         
-        # Add image to last user message if provided
-        if image and chat_messages:
-            # Find last user message
+        # Collect extra parts (legacy image + new files) and inject into the last user message
+        _extra_parts: List[Any] = []
+        if image:
+            _extra_parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image}})
+        if files:
+            for f in files:
+                _extra_parts.append(self._resolve_file_part(f))
+        if _extra_parts and chat_messages:
             for msg in reversed(chat_messages):
                 if msg["role"] == "user":
-                    msg["parts"].append({
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image
-                        }
-                    })
+                    msg["parts"].extend(_extra_parts)
                     break
         
         # Format tools if provided

@@ -14,7 +14,8 @@ from collections.abc import AsyncGenerator
 from syndicate.protocols import AgentInterface
 from syndicate.agents.runtime import AgentRuntime
 from syndicate.agents.base import BaseAgent
-from syndicate.communication_models import Message, ToolCall, ChatResponse, StreamChunk, ToolResultEnvelope
+from syndicate.communication_models import Message, ToolCall, ChatResponse, StreamChunk, ToolResultEnvelope, File
+from syndicate.clients.gemini import UploadedFile
 from syndicate.clients.gemini import GeminiClient
 from syndicate.clients.openai import OpenAIClient
 from syndicate.memory.local import LocalMemory
@@ -4106,3 +4107,350 @@ class ElasticsearchVectorStoreTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# File + UploadedFile — model contract tests
+# ---------------------------------------------------------------------------
+
+class GeminiFileModelTests(unittest.TestCase):
+    """Pydantic model contract tests for File and UploadedFile."""
+
+    def test_file_minimal_construction(self):
+        f = File(data=b"hello", mime_type="text/plain")
+        self.assertEqual(f.data, b"hello")
+        self.assertEqual(f.mime_type, "text/plain")
+        self.assertIsNone(f.name)
+
+    def test_file_with_optional_name(self):
+        f = File(data=b"hello", mime_type="application/pdf", name="doc.pdf")
+        self.assertEqual(f.name, "doc.pdf")
+
+    def test_file_requires_bytes_not_str(self):
+        with self.assertRaises(Exception):
+            File(data="not bytes", mime_type="text/plain")
+
+    def test_file_missing_mime_type_raises(self):
+        with self.assertRaises(Exception):
+            File(data=b"hello")
+
+    def test_uploaded_file_construction(self):
+        uf = UploadedFile(uri="files/abc123", mime_type="application/pdf", name="files/abc123")
+        self.assertEqual(uf.uri, "files/abc123")
+        self.assertEqual(uf.mime_type, "application/pdf")
+        self.assertEqual(uf.name, "files/abc123")
+
+    def test_uploaded_file_missing_name_raises(self):
+        with self.assertRaises(Exception):
+            UploadedFile(uri="files/abc", mime_type="text/plain")
+
+    def test_uploaded_file_missing_uri_raises(self):
+        with self.assertRaises(Exception):
+            UploadedFile(mime_type="text/plain", name="files/abc")
+
+
+# ---------------------------------------------------------------------------
+# _resolve_file_part — unit tests
+# ---------------------------------------------------------------------------
+
+from google.genai import types as _gemini_types
+
+
+class GeminiResolveFilePartTests(unittest.TestCase):
+    """Unit tests for GeminiClient._resolve_file_part."""
+
+    def setUp(self):
+        self.client = GeminiClient.__new__(GeminiClient)
+
+    def test_file_resolves_to_inline_part(self):
+        f = File(data=b"%PDF-1.4", mime_type="application/pdf")
+        part = self.client._resolve_file_part(f)
+        self.assertIsInstance(part, _gemini_types.Part)
+        self.assertIsNotNone(part.inline_data)
+        self.assertEqual(part.inline_data.mime_type, "application/pdf")
+        self.assertEqual(part.inline_data.data, b"%PDF-1.4")
+
+    def test_file_audio_resolves_correctly(self):
+        data = b"audio-bytes"
+        f = File(data=data, mime_type="audio/mp3", name="clip.mp3")
+        part = self.client._resolve_file_part(f)
+        self.assertIsInstance(part, _gemini_types.Part)
+        self.assertEqual(part.inline_data.data, data)
+        self.assertEqual(part.inline_data.mime_type, "audio/mp3")
+
+    def test_uploaded_file_resolves_to_uri_part(self):
+        uf = UploadedFile(uri="files/abc123", mime_type="video/mp4", name="files/abc123")
+        part = self.client._resolve_file_part(uf)
+        self.assertIsInstance(part, _gemini_types.Part)
+        self.assertIsNotNone(part.file_data)
+        self.assertEqual(part.file_data.file_uri, "files/abc123")
+        self.assertEqual(part.file_data.mime_type, "video/mp4")
+
+    def test_wrong_type_raises_typeerror(self):
+        # Old tuple API must be rejected — callers must use File()
+        with self.assertRaises(TypeError):
+            self.client._resolve_file_part((b"bytes", "text/plain"))
+
+    def test_plain_string_raises_typeerror(self):
+        with self.assertRaises(TypeError):
+            self.client._resolve_file_part("files/abc123")
+
+    def test_none_raises_typeerror(self):
+        with self.assertRaises(TypeError):
+            self.client._resolve_file_part(None)
+
+
+# ---------------------------------------------------------------------------
+# upload_file — async unit tests
+# ---------------------------------------------------------------------------
+
+class GeminiUploadFileTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for GeminiClient.upload_file()."""
+
+    def _make_client(self, mock_raw):
+        client = GeminiClient.__new__(GeminiClient)
+        mock_sdk_client = AsyncMock()
+        mock_sdk_client.aio.files.upload = AsyncMock(return_value=mock_raw)
+        client.client = mock_sdk_client
+        return client
+
+    async def test_returns_uploaded_file_with_correct_fields(self):
+        mock_raw = SimpleNamespace(uri="files/xyz789", mime_type="application/pdf", name="files/xyz789")
+        client = self._make_client(mock_raw)
+
+        result = await client.upload_file(File(data=b"%PDF", mime_type="application/pdf"))
+
+        self.assertIsInstance(result, UploadedFile)
+        self.assertEqual(result.uri, "files/xyz789")
+        self.assertEqual(result.mime_type, "application/pdf")
+        self.assertEqual(result.name, "files/xyz789")
+
+    async def test_bytes_are_wrapped_in_bytesio(self):
+        import io as _io
+        mock_raw = SimpleNamespace(uri="files/xyz", mime_type="audio/mp3", name="files/xyz")
+        client = self._make_client(mock_raw)
+
+        pdf_bytes = b"audio-content"
+        await client.upload_file(File(data=pdf_bytes, mime_type="audio/mp3"))
+
+        call_kwargs = client.client.aio.files.upload.call_args.kwargs
+        file_arg = call_kwargs["file"]
+        self.assertIsInstance(file_arg, _io.BytesIO)
+        self.assertEqual(file_arg.read(), pdf_bytes)
+
+    async def test_display_name_forwarded_when_set(self):
+        mock_raw = SimpleNamespace(uri="files/n1", mime_type="text/plain", name="files/n1")
+        client = self._make_client(mock_raw)
+
+        await client.upload_file(File(data=b"hi", mime_type="text/plain", name="my-doc.txt"))
+
+        call_kwargs = client.client.aio.files.upload.call_args.kwargs
+        self.assertEqual(call_kwargs["config"].display_name, "my-doc.txt")
+
+    async def test_display_name_none_when_file_has_no_name(self):
+        mock_raw = SimpleNamespace(uri="files/n2", mime_type="text/plain", name="files/n2")
+        client = self._make_client(mock_raw)
+
+        await client.upload_file(File(data=b"hi", mime_type="text/plain"))
+
+        call_kwargs = client.client.aio.files.upload.call_args.kwargs
+        self.assertIsNone(call_kwargs["config"].display_name)
+
+    async def test_mime_type_forwarded_in_config(self):
+        mock_raw = SimpleNamespace(uri="files/n3", mime_type="image/png", name="files/n3")
+        client = self._make_client(mock_raw)
+
+        await client.upload_file(File(data=b"\x89PNG", mime_type="image/png"))
+
+        call_kwargs = client.client.aio.files.upload.call_args.kwargs
+        self.assertEqual(call_kwargs["config"].mime_type, "image/png")
+
+
+# ---------------------------------------------------------------------------
+# files= injection — chat_completion_async and chat_completion_stream
+# ---------------------------------------------------------------------------
+
+class GeminiFileInjectionTests(unittest.IsolatedAsyncioTestCase):
+    """Tests that File/UploadedFile objects are correctly injected into the
+    last user message's parts before the API call is made."""
+
+    def _make_client(self):
+        client = GeminiClient.__new__(GeminiClient)
+        client.model_name = "gemini-test"
+        client.temperature = 0.7
+        mock_sdk_client = AsyncMock()
+        # generate_content returns a bare response with no candidates
+        mock_sdk_client.aio.models.generate_content = AsyncMock(
+            return_value=SimpleNamespace(candidates=None, usage_metadata=None)
+        )
+        client.client = mock_sdk_client
+        return client
+
+    def _make_stream_client(self):
+        async def _empty_stream():
+            return
+            yield  # pragma: no cover — makes this an async generator
+
+        client = GeminiClient.__new__(GeminiClient)
+        client.model_name = "gemini-test"
+        client.temperature = 0.7
+        mock_sdk_client = AsyncMock()
+        mock_sdk_client.aio.models.generate_content_stream = AsyncMock(
+            return_value=_empty_stream()
+        )
+        client.client = mock_sdk_client
+        return client
+
+    def _last_user_parts(self, call_kwargs):
+        contents = call_kwargs["contents"]
+        for msg in reversed(contents):
+            if msg["role"] == "user":
+                return msg["parts"]
+        return []
+
+    # --- chat_completion_async ---
+
+    async def test_async_inline_file_appended_to_last_user_message(self):
+        client = self._make_client()
+        messages = [Message(role="human", content="Summarize this")]
+        await client.chat_completion_async(
+            messages, files=[File(data=b"%PDF-1.4", mime_type="application/pdf")]
+        )
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 2)
+        self.assertIsInstance(parts[1], _gemini_types.Part)
+        self.assertEqual(parts[1].inline_data.mime_type, "application/pdf")
+
+    async def test_async_uploaded_file_appended_to_last_user_message(self):
+        client = self._make_client()
+        messages = [Message(role="human", content="Describe this video")]
+        uf = UploadedFile(uri="files/vid001", mime_type="video/mp4", name="files/vid001")
+        await client.chat_completion_async(messages, files=[uf])
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 2)
+        self.assertIsInstance(parts[1], _gemini_types.Part)
+        self.assertEqual(parts[1].file_data.file_uri, "files/vid001")
+
+    async def test_async_multiple_files_appended_in_order(self):
+        client = self._make_client()
+        messages = [Message(role="human", content="Compare these")]
+        files = [
+            File(data=b"doc1", mime_type="application/pdf"),
+            File(data=b"doc2", mime_type="application/pdf"),
+        ]
+        await client.chat_completion_async(messages, files=files)
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[1].inline_data.data, b"doc1")
+        self.assertEqual(parts[2].inline_data.data, b"doc2")
+
+    async def test_async_files_injected_into_last_user_message_not_first(self):
+        client = self._make_client()
+        messages = [
+            Message(role="human", content="first turn"),
+            Message(role="ai", content="response"),
+            Message(role="human", content="second turn"),
+        ]
+        await client.chat_completion_async(
+            messages, files=[File(data=b"x", mime_type="text/plain")]
+        )
+
+        contents = client.client.aio.models.generate_content.call_args.kwargs["contents"]
+        user_msgs = [m for m in contents if m["role"] == "user"]
+        self.assertEqual(len(user_msgs), 2)
+        # First user message untouched — only one part (the text)
+        self.assertEqual(len(user_msgs[0]["parts"]), 1)
+        # Last user message has the file appended
+        self.assertEqual(len(user_msgs[1]["parts"]), 2)
+
+    async def test_async_no_files_does_not_modify_parts(self):
+        client = self._make_client()
+        messages = [Message(role="human", content="hello")]
+        await client.chat_completion_async(messages, files=None)
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["text"], "hello")
+
+    async def test_async_empty_files_list_does_not_modify_parts(self):
+        client = self._make_client()
+        messages = [Message(role="human", content="hello")]
+        await client.chat_completion_async(messages, files=[])
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 1)
+
+    async def test_async_mixed_file_and_uploaded_file(self):
+        client = self._make_client()
+        messages = [Message(role="human", content="analyze")]
+        files = [
+            File(data=b"inline-bytes", mime_type="text/plain"),
+            UploadedFile(uri="files/large001", mime_type="application/pdf", name="files/large001"),
+        ]
+        await client.chat_completion_async(messages, files=files)
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 3)
+        self.assertIsNotNone(parts[1].inline_data)
+        self.assertIsNotNone(parts[2].file_data)
+
+    # --- chat_completion_stream ---
+
+    async def test_stream_inline_file_appended_to_last_user_message(self):
+        client = self._make_stream_client()
+        messages = [Message(role="human", content="Summarize this")]
+        async for _ in client.chat_completion_stream(
+            messages, files=[File(data=b"%PDF-1.4", mime_type="application/pdf")]
+        ):
+            pass
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content_stream.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 2)
+        self.assertIsInstance(parts[1], _gemini_types.Part)
+        self.assertEqual(parts[1].inline_data.mime_type, "application/pdf")
+
+    async def test_stream_files_injected_into_last_user_message_not_first(self):
+        client = self._make_stream_client()
+        messages = [
+            Message(role="human", content="first turn"),
+            Message(role="ai", content="response"),
+            Message(role="human", content="second turn"),
+        ]
+        async for _ in client.chat_completion_stream(
+            messages, files=[File(data=b"x", mime_type="text/plain")]
+        ):
+            pass
+
+        contents = client.client.aio.models.generate_content_stream.call_args.kwargs["contents"]
+        user_msgs = [m for m in contents if m["role"] == "user"]
+        self.assertEqual(len(user_msgs[0]["parts"]), 1)
+        self.assertEqual(len(user_msgs[1]["parts"]), 2)
+
+    async def test_stream_no_files_does_not_modify_parts(self):
+        client = self._make_stream_client()
+        messages = [Message(role="human", content="hello")]
+        async for _ in client.chat_completion_stream(messages, files=None):
+            pass
+
+        parts = self._last_user_parts(
+            client.client.aio.models.generate_content_stream.call_args.kwargs
+        )
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["text"], "hello")

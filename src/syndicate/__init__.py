@@ -13,6 +13,7 @@ from .communication_models import (
     ChatResponse,
     StreamChunk,
     ToolCallEvent,
+    File,
 )
 from .protocols import AgentInterface, Observer
 from .observability import LoggingObserver, InMemoryObserver

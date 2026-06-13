@@ -706,6 +706,7 @@ class BaseAgent(ABC):
         chat_id: str = "default",
         target_index: Optional[int] = None,
         mode: str = "message",
+        files: Optional[List[Any]] = None,
         **kwargs,
     ) -> ChatResponse:
         """Regenerate an AI response by truncating active history and replaying.
@@ -719,6 +720,10 @@ class BaseAgent(ABC):
                   tool-call message, all intermediate tool/result messages, and
                   the final answer — then replays the full agentic loop including
                   fresh tool executions.
+            files: Optional list of :class:`~syndicate.communication_models.File`
+                or provider-specific uploaded-file objects to attach to the last
+                user message during replay.  Useful when the original request
+                included file context that is not stored in history.
 
         Behavior:
         - Operates on active bucket history only.
@@ -812,7 +817,7 @@ class BaseAgent(ABC):
             formatted_tools_token = self._request_formatted_tools_ctx.set(request_config["formatted_tools"])
             tool_map_token = self._request_tool_map_ctx.set(request_config["tool_map"])
 
-            regenerated_text = await self._run_agent(messages, **kwargs)
+            regenerated_text = await self._run_agent(messages, files=files, **kwargs)
             new_messages = messages[initial_length:]
             if not new_messages:
                 # Keep persistence resilient for custom _run_agent overrides
